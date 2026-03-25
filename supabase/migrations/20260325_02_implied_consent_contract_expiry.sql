@@ -1,0 +1,34 @@
+-- ============================================
+-- NOD — Conversation 2: Implied Consent + Contract-Based Expiry
+-- Consolidated migration: no schema changes (all SQL was correct from Conv 1)
+-- Deployed: 2026-03-25
+-- ============================================
+
+-- ============================================
+-- SUMMARY
+--
+-- No PostgreSQL changes required. get_consent_status_batch() and
+-- insert_consent_record() from Conv 1 already handled all implied
+-- consent types correctly.
+--
+-- TypeScript changes:
+--   1. Extracted _shared/expiry-calculator.ts from inline function
+--      in api-consent/index.ts for reuse by batch import (Conv 4)
+--   2. Updated api-consent/index.ts to import from shared module
+--   3. Redeployed api-consent Edge Function
+--
+-- ============================================
+-- TEST RESULTS (2026-03-25)
+--
+-- Test A:  implied_ebr (purchase) → 201, expiry = event + 2yr ✅
+-- Test B:  implied_inquiry (test drive) → 201, expiry = event + 6mo ✅
+-- Test C:  implied_ebr_contract (financing, contract expires 2027) → expiry 2029 ✅
+-- Test D:  implied_ebr_contract (expired contract) → status 'no_consent' ✅
+-- Test E:  implied_ebr_contract without contract_expiry_date → 400 MISSING_CONTRACT_EXPIRY ✅
+-- Test F:  express + implied_ebr → status 'express' (higher precedence) ✅
+-- Test G:  implied_inquiry expiring in 6 days → warning returned ✅
+-- Test H:  EBR renewal (newer service visit) → later expiry returned ✅
+-- Test I:  implied_ebr + implied_inquiry → status 'implied_ebr' (higher precedence) ✅
+-- Test J:  conspicuous_publication → requires_relevance_check = true + warning ✅
+-- Test K:  Batch (7 contacts, mixed types) → single RPC, all correct ✅
+-- ============================================
