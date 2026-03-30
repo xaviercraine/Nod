@@ -1,0 +1,670 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Nod — CASL Compliance Automation API",
+    "description": "Nod automates CASL (Canada's Anti-Spam Legislation) compliance for Canadian auto dealerships. It provides consent tracking, message classification, pre-send compliance checks, unsubscribe management, and court-ready proof generation.",
+    "version": "2026-03",
+    "contact": {
+      "name": "Nod Support",
+      "email": "support@nod.law"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://ftpdwqczietgxqvxpptv.supabase.co/functions/v1",
+      "description": "Production"
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API key issued per tenant. Prefix: nod_live_ or nod_test_. Pass as Bearer token in Authorization header."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error", "code"],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable error message"
+          },
+          "code": {
+            "type": "string",
+            "description": "Machine-readable error code"
+          },
+          "details": {
+            "type": "object",
+            "description": "Additional context (never contains PII)"
+          }
+        }
+      },
+      "ConsentType": {
+        "type": "string",
+        "enum": ["express", "pre_casl_express", "implied_ebr", "implied_ebr_contract", "implied_inquiry", "conspicuous_publication"]
+      },
+      "MessageChannel": {
+        "type": "string",
+        "enum": ["email", "sms"]
+      },
+      "MessageClassification": {
+        "type": "string",
+        "enum": ["cem", "transactional", "tier1_exempt", "tier2_exempt", "non_commercial"]
+      },
+      "ComplianceResult": {
+        "type": "string",
+        "enum": ["pass", "fail", "warning"]
+      },
+      "QualifyingEventType": {
+        "type": "string",
+        "enum": ["purchase", "lease", "service", "test_drive", "inquiry", "financing_contract", "service_contract", "lease_contract", "bartering", "other"]
+      },
+      "ConsentStatus": {
+        "type": "object",
+        "properties": {
+          "contact_id": { "type": "string", "format": "uuid" },
+          "status": { "type": "string", "description": "Consent type or 'no_consent'" },
+          "consent_record_id": { "type": "string", "format": "uuid", "nullable": true },
+          "expiry_date": { "type": "string", "format": "date-time", "nullable": true },
+          "days_until_expiry": { "type": "integer", "nullable": true },
+          "requires_relevance_check": { "type": "boolean" },
+          "warning": { "type": "string", "nullable": true }
+        }
+      },
+      "ConsentRecord": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenant_id": { "type": "string", "format": "uuid" },
+          "contact_id": { "type": "string", "format": "uuid" },
+          "consent_type": { "$ref": "#/components/schemas/ConsentType" },
+          "channel": { "$ref": "#/components/schemas/MessageChannel" },
+          "qualifying_event_type": { "$ref": "#/components/schemas/QualifyingEventType" },
+          "qualifying_event": { "type": "string" },
+          "qualifying_event_date": { "type": "string", "format": "date-time" },
+          "contract_expiry_date": { "type": "string", "format": "date-time", "nullable": true },
+          "expiry_date": { "type": "string", "format": "date-time", "nullable": true },
+          "purpose": { "type": "string", "nullable": true },
+          "evidence_type": { "type": "string", "nullable": true },
+          "evidence_url": { "type": "string", "nullable": true },
+          "source_description": { "type": "string", "nullable": true },
+          "obtained_by": { "type": "string", "nullable": true },
+          "is_withdrawal": { "type": "boolean" },
+          "withdrawal_method": { "type": "string", "nullable": true },
+          "idempotency_key": { "type": "string", "format": "uuid", "nullable": true },
+          "notes": { "type": "string", "nullable": true },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "SenderProfile": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenant_id": { "type": "string", "format": "uuid" },
+          "sender_name": { "type": "string" },
+          "on_behalf_of": { "type": "string", "nullable": true },
+          "mailing_address": { "type": "string" },
+          "phone": { "type": "string", "nullable": true },
+          "email": { "type": "string", "nullable": true },
+          "website_url": { "type": "string", "nullable": true },
+          "is_default": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Contact": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "external_id": { "type": "string", "nullable": true },
+          "full_name": { "type": "string" },
+          "email": { "type": "string", "nullable": true },
+          "phone": { "type": "string", "nullable": true },
+          "company": { "type": "string", "nullable": true },
+          "source": { "type": "string", "nullable": true },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "is_active": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "consent": { "$ref": "#/components/schemas/ConsentStatus" }
+        }
+      },
+      "ClassificationResult": {
+        "type": "object",
+        "properties": {
+          "classification": { "$ref": "#/components/schemas/MessageClassification" },
+          "reasons": { "type": "array", "items": { "type": "string" } },
+          "requires_consent": { "type": "boolean" },
+          "requires_sender_id": { "type": "boolean" },
+          "requires_unsubscribe": { "type": "boolean" }
+        }
+      },
+      "ComplianceFailure": {
+        "type": "object",
+        "properties": {
+          "field": { "type": "string" },
+          "code": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
+      "ComplianceWarning": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string" },
+          "message": { "type": "string" },
+          "days_until_expiry": { "type": "integer" }
+        }
+      },
+      "RateLimitDetails": {
+        "type": "object",
+        "properties": {
+          "minute_limit": { "type": "integer" },
+          "minute_remaining": { "type": "integer" },
+          "minute_reset": { "type": "integer" },
+          "hour_limit": { "type": "integer" },
+          "hour_remaining": { "type": "integer" },
+          "hour_reset": { "type": "integer" },
+          "retry_after": { "type": "integer" }
+        }
+      }
+    },
+    "headers": {
+      "X-Nod-Version": {
+        "description": "API version identifier",
+        "schema": { "type": "string", "example": "2026-03" }
+      },
+      "X-RateLimit-Limit": {
+        "description": "Request limit for the current window (most restrictive of minute/hour)",
+        "schema": { "type": "integer" }
+      },
+      "X-RateLimit-Remaining": {
+        "description": "Remaining requests in the current window",
+        "schema": { "type": "integer" }
+      },
+      "X-RateLimit-Reset": {
+        "description": "Unix epoch timestamp when the current window resets",
+        "schema": { "type": "integer" }
+      },
+      "Retry-After": {
+        "description": "Seconds until the rate limit window resets (only on 429 responses)",
+        "schema": { "type": "integer" }
+      }
+    },
+    "parameters": {
+      "ChannelQuery": {
+        "name": "channel",
+        "in": "query",
+        "required": true,
+        "schema": { "$ref": "#/components/schemas/MessageChannel" }
+      }
+    }
+  },
+  "paths": {
+    "/api-consent/record": {
+      "post": {
+        "tags": ["Consent"],
+        "summary": "Record consent",
+        "description": "Record a consent event (express, implied, pre-CASL). Creates an immutable consent_record. Consent records are strictly INSERT-only — never updated or deleted.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["contact_id", "consent_type", "channel", "qualifying_event_type", "qualifying_event", "qualifying_event_date"],
+                "properties": {
+                  "contact_id": { "type": "string", "format": "uuid" },
+                  "consent_type": { "$ref": "#/components/schemas/ConsentType" },
+                  "channel": { "$ref": "#/components/schemas/MessageChannel" },
+                  "qualifying_event_type": { "$ref": "#/components/schemas/QualifyingEventType" },
+                  "qualifying_event": { "type": "string", "description": "Human-readable event description" },
+                  "qualifying_event_date": { "type": "string", "format": "date-time", "description": "Must not be in the future" },
+                  "contract_expiry_date": { "type": "string", "format": "date-time", "description": "Required for implied_ebr_contract" },
+                  "purpose": { "type": "string", "description": "Required for express and pre_casl_express" },
+                  "evidence_type": { "type": "string", "enum": ["electronic_form", "signed_form", "audio", "transaction_record"] },
+                  "evidence_url": { "type": "string" },
+                  "source_description": { "type": "string" },
+                  "obtained_by": { "type": "string" },
+                  "idempotency_key": { "type": "string", "format": "uuid", "description": "If provided and already exists, returns existing record" },
+                  "notes": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Consent recorded successfully",
+            "headers": {
+              "X-Nod-Version": { "$ref": "#/components/headers/X-Nod-Version" },
+              "X-RateLimit-Limit": { "$ref": "#/components/headers/X-RateLimit-Limit" },
+              "X-RateLimit-Remaining": { "$ref": "#/components/headers/X-RateLimit-Remaining" },
+              "X-RateLimit-Reset": { "$ref": "#/components/headers/X-RateLimit-Reset" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ConsentRecord" }
+              }
+            }
+          },
+          "400": { "description": "Validation error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Contact not found for this tenant", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "headers": { "Retry-After": { "$ref": "#/components/headers/Retry-After" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-consent/status": {
+      "get": {
+        "tags": ["Consent"],
+        "summary": "Check consent status",
+        "description": "Evaluate current consent status for a contact on a specific channel. Uses the batch consent evaluation engine internally.",
+        "parameters": [
+          { "name": "contact_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "$ref": "#/components/parameters/ChannelQuery" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Consent status",
+            "headers": {
+              "X-Nod-Version": { "$ref": "#/components/headers/X-Nod-Version" },
+              "X-RateLimit-Limit": { "$ref": "#/components/headers/X-RateLimit-Limit" },
+              "X-RateLimit-Remaining": { "$ref": "#/components/headers/X-RateLimit-Remaining" },
+              "X-RateLimit-Reset": { "$ref": "#/components/headers/X-RateLimit-Reset" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ConsentStatus" }
+              }
+            }
+          },
+          "400": { "description": "Missing or invalid parameters", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Contact not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-unsubscribe": {
+      "post": {
+        "tags": ["Unsubscribe"],
+        "summary": "Process consent withdrawal",
+        "description": "Record a consent withdrawal. Creates an immutable withdrawal record, calculates 10-business-day CRM sync deadline (excluding Ontario statutory holidays), and blocks future messages on that channel.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["contact_id", "channel", "method"],
+                "properties": {
+                  "contact_id": { "type": "string", "format": "uuid" },
+                  "channel": { "$ref": "#/components/schemas/MessageChannel" },
+                  "method": { "type": "string", "description": "How the unsubscribe was received (e.g., 'email_link', 'phone_call')" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Withdrawal processed" },
+          "400": { "description": "Validation error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Contact not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-unsubscribe/{id}/synced": {
+      "patch": {
+        "tags": ["Unsubscribe"],
+        "summary": "Confirm CRM sync",
+        "description": "Mark an unsubscribe request as synced with the CRM system.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Unsubscribe request ID" }
+        ],
+        "responses": {
+          "200": { "description": "Sync confirmed" },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Unsubscribe request not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-contacts/import": {
+      "post": {
+        "tags": ["Contacts"],
+        "summary": "Batch import contacts",
+        "description": "Import up to 500 contacts with optional DMS consent classification. Deduplicates by email and phone per tenant. Does NOT increment the monthly message counter.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["contacts"],
+                "properties": {
+                  "contacts": {
+                    "type": "array",
+                    "maxItems": 500,
+                    "items": {
+                      "type": "object",
+                      "required": ["full_name"],
+                      "properties": {
+                        "full_name": { "type": "string" },
+                        "email": { "type": "string", "format": "email" },
+                        "phone": { "type": "string", "description": "E.164 format" },
+                        "external_id": { "type": "string" },
+                        "company": { "type": "string" },
+                        "source": { "type": "string" },
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "purchase_date": { "type": "string", "format": "date-time", "description": "Creates implied_ebr consent" },
+                        "inquiry_date": { "type": "string", "format": "date-time", "description": "Creates implied_inquiry consent" },
+                        "financing_contract_start": { "type": "string", "format": "date-time" },
+                        "financing_contract_end": { "type": "string", "format": "date-time", "description": "Required with financing_contract_start. Creates implied_ebr_contract" },
+                        "express_consent_date": { "type": "string", "format": "date-time" },
+                        "express_purpose": { "type": "string", "description": "Required with express_consent_date" },
+                        "express_evidence_type": { "type": "string" },
+                        "express_evidence_url": { "type": "string" },
+                        "express_obtained_by": { "type": "string" },
+                        "channel": { "$ref": "#/components/schemas/MessageChannel" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Import complete" },
+          "400": { "description": "Validation error or max_contacts exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-contacts": {
+      "get": {
+        "tags": ["Contacts"],
+        "summary": "List contacts",
+        "description": "Paginated contact list with search and consent status filter. Consent status evaluated via batch RPC.",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 50, "maximum": 200 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } },
+          { "name": "search", "in": "query", "schema": { "type": "string" }, "description": "Search by name, email, or phone" },
+          { "name": "consent_status", "in": "query", "schema": { "type": "string" }, "description": "Filter by consent status (e.g., 'express', 'no_consent')" },
+          { "name": "channel", "in": "query", "schema": { "$ref": "#/components/schemas/MessageChannel" }, "description": "Channel for consent evaluation (default: email)" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contact list with consent status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "contacts": { "type": "array", "items": { "$ref": "#/components/schemas/Contact" } },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "total": { "type": "integer" },
+                        "limit": { "type": "integer" },
+                        "offset": { "type": "integer" },
+                        "has_more": { "type": "boolean" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-messages/classify": {
+      "post": {
+        "tags": ["Messages"],
+        "summary": "Classify a message",
+        "description": "Classify a message under CASL rules. Uses the 'one of its purposes' test [Act s.1(2)] — any commercial signal triggers CEM classification.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["channel"],
+                "properties": {
+                  "subject": { "type": "string" },
+                  "body": { "type": "string" },
+                  "channel": { "$ref": "#/components/schemas/MessageChannel" },
+                  "message_type_hint": { "type": "string", "enum": ["tier1_exempt"], "description": "Override to tier1_exempt (requires exemption_reason)" },
+                  "exemption_reason": { "type": "string", "description": "Required when message_type_hint is tier1_exempt" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Classification result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClassificationResult" } } } },
+          "400": { "description": "Validation error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-messages/check": {
+      "post": {
+        "tags": ["Messages"],
+        "summary": "Pre-send compliance check",
+        "description": "Full compliance pipeline: classify → check consent → validate sender ID → validate unsubscribe → record result. Accepts single contact_id or batch contact_ids array.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["channel", "sender_profile_id"],
+                "properties": {
+                  "contact_id": { "type": "string", "format": "uuid", "description": "Single contact (mutually exclusive with contact_ids)" },
+                  "contact_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "description": "Batch contacts (mutually exclusive with contact_id)" },
+                  "channel": { "$ref": "#/components/schemas/MessageChannel" },
+                  "subject": { "type": "string" },
+                  "body": { "type": "string" },
+                  "sender_profile_id": { "type": "string", "format": "uuid" },
+                  "unsubscribe_url": { "type": "string", "format": "uri" },
+                  "message_type_hint": { "type": "string", "enum": ["tier1_exempt"] },
+                  "exemption_reason": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Compliance check result (single or batch)" },
+          "400": { "description": "Validation error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "402": { "description": "Monthly message limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Contact or sender profile not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-messages-validate": {
+      "post": {
+        "tags": ["Messages"],
+        "summary": "Validate sender ID + unsubscribe mechanism",
+        "description": "Validate a sender profile's CASL s.6(2) compliance and unsubscribe mechanism s.11 compliance against a message classification.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["sender_profile_id", "classification"],
+                "properties": {
+                  "sender_profile_id": { "type": "string", "format": "uuid" },
+                  "unsubscribe_url": { "type": "string", "format": "uri" },
+                  "classification": { "$ref": "#/components/schemas/MessageClassification" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Validation result" },
+          "400": { "description": "Validation error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Sender profile not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-sender-profiles": {
+      "post": {
+        "tags": ["Sender Profiles"],
+        "summary": "Create sender profile",
+        "description": "Create a new CASL s.6(2) sender identification profile. At least one contact method (phone, email, or website_url) is required.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["sender_name", "mailing_address"],
+                "properties": {
+                  "sender_name": { "type": "string" },
+                  "mailing_address": { "type": "string" },
+                  "on_behalf_of": { "type": "string" },
+                  "phone": { "type": "string" },
+                  "email": { "type": "string", "format": "email" },
+                  "website_url": { "type": "string", "format": "uri" },
+                  "is_default": { "type": "boolean", "default": false }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Profile created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SenderProfile" } } } },
+          "400": { "description": "Validation error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "get": {
+        "tags": ["Sender Profiles"],
+        "summary": "List sender profiles",
+        "description": "List all sender profiles for the authenticated tenant. Default profile listed first.",
+        "responses": {
+          "200": { "description": "Profile list", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/SenderProfile" } } } } },
+          "401": { "description": "Invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api-sender-profiles/{id}": {
+      "get": {
+        "tags": ["Sender Profiles"],
+        "summary": "Get sender profile",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Profile details", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SenderProfile" } } } },
+          "401": { "description": "Invalid API key" },
+          "404": { "description": "Profile not found" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      },
+      "patch": {
+        "tags": ["Sender Profiles"],
+        "summary": "Update sender profile",
+        "description": "Partial update. Use '__UNCHANGED__' sentinel for nullable fields to distinguish 'don't change' from 'set to NULL'.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sender_name": { "type": "string" },
+                  "mailing_address": { "type": "string" },
+                  "on_behalf_of": { "type": "string", "nullable": true },
+                  "phone": { "type": "string", "nullable": true },
+                  "email": { "type": "string", "nullable": true },
+                  "website_url": { "type": "string", "nullable": true },
+                  "is_default": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Profile updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SenderProfile" } } } },
+          "400": { "description": "Validation error" },
+          "401": { "description": "Invalid API key" },
+          "404": { "description": "Profile not found" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      },
+      "delete": {
+        "tags": ["Sender Profiles"],
+        "summary": "Delete sender profile",
+        "description": "Hard delete. Blocked if referenced by message_checks within the last 60 days [CASL s.6(3)].",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Profile deleted" },
+          "401": { "description": "Invalid API key" },
+          "404": { "description": "Profile not found" },
+          "409": { "description": "Profile referenced by recent message checks — cannot delete" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      }
+    },
+    "/api-compliance/proof/{contact_id}": {
+      "get": {
+        "tags": ["Compliance"],
+        "summary": "Generate consent proof dossier",
+        "description": "Generate a CASL s.13 court-ready proof package for a contact. Includes consent timeline, message checks, audit trail, and PDF upload.",
+        "parameters": [
+          { "name": "contact_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Proof dossier with signed PDF URL" },
+          "401": { "description": "Invalid API key" },
+          "404": { "description": "Contact not found" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      }
+    },
+    "/api-compliance/audit": {
+      "get": {
+        "tags": ["Compliance"],
+        "summary": "Tenant compliance audit",
+        "description": "Comprehensive compliance audit: 16 metrics, weighted 0-100 score (consent coverage 40%, CRM sync 20%, sender profiles 15%, check pass rate 15%, audit completeness 10%), expiry alerts, and actionable findings.",
+        "responses": {
+          "200": { "description": "Audit results with score, metrics, findings, and expiry alerts" },
+          "401": { "description": "Invalid API key" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      }
+    }
+  },
+  "tags": [
+    { "name": "Consent", "description": "Consent lifecycle: record, evaluate, track expiry" },
+    { "name": "Unsubscribe", "description": "Consent withdrawal + 10-business-day CRM sync" },
+    { "name": "Contacts", "description": "Contact management + batch import with DMS classification" },
+    { "name": "Messages", "description": "Classification, validation, and pre-send compliance checks" },
+    { "name": "Sender Profiles", "description": "CASL s.6(2) sender identification management" },
+    { "name": "Compliance", "description": "Proof generation + audit scoring" }
+  ]
+}
