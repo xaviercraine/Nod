@@ -1,0 +1,172 @@
+// ============================================
+// NOD — _shared/rate-limiter.ts
+// Conversation 12: Rate limiting per API key per plan tier.
+//
+// Wraps check_rate_limit() RPC (atomic upsert + tier detection).
+// Provides:
+//   checkRateLimit() — call the RPC, return structured result
+//   rateLimitHeaders() — build X-RateLimit-* headers from result
+//   rateLimitExceededResponse() — 429 response with Retry-After
+//   API_VERSION — current API version string
+//   apiVersionHeaders() — X-Nod-Version header
+//   standardHeaders() — combines rate limit + version + CORS
+// ============================================
+
+import { getSupabaseClient } from "./supabase.ts";
+
+// ---- API Version ----
+
+export const API_VERSION = "2026-03";
+
+// ---- Types ----
+
+export interface RateLimitResult {
+  allowed: boolean;
+  minute_limit: number;
+  minute_remaining: number;
+  minute_reset_epoch: number;
+  hour_limit: number;
+  hour_remaining: number;
+  hour_reset_epoch: number;
+}
+
+// ---- Core: Check Rate Limit ----
+
+/**
+ * Check rate limit for an API key. Calls check_rate_limit() RPC
+ * which atomically increments counters and returns limits.
+ *
+ * Fail-open: if the RPC errors, returns null (allow the request).
+ */
+export async function checkRateLimit(
+  apiKeyId: string,
+  tenantId: string,
+): Promise<RateLimitResult | null> {
+  try {
+    const supabase = getSupabaseClient();
+
+    const { data, error } = await supabase.rpc("check_rate_limit", {
+      p_api_key_id: apiKeyId,
+      p_tenant_id: tenantId,
+    });
+
+    if (error) {
+      console.error("Rate limit check failed:", error.message);
+      return null; // fail-open
+    }
+
+    // RPC returns an array (RETURNS TABLE); take first row
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) return null;
+
+    return row as RateLimitResult;
+  } catch (err) {
+    console.error(
+      "Rate limit exception:",
+      err instanceof Error ? err.message : "Unknown",
+    );
+    return null; // fail-open
+  }
+}
+
+// ---- Header Builders ----
+
+/**
+ * Build rate limit headers from a RateLimitResult.
+ * Uses the most restrictive window (minute vs hour) for the primary headers.
+ */
+export function rateLimitHeaders(
+  result: RateLimitResult,
+): Record<string, string> {
+  // Use whichever window is more restrictive (lower remaining percentage)
+  const minutePct =
+    result.minute_limit > 0
+      ? result.minute_remaining / result.minute_limit
+      : 1;
+  const hourPct =
+    result.hour_limit > 0 ? result.hour_remaining / result.hour_limit : 1;
+
+  const useMinute = minutePct <= hourPct;
+
+  return {
+    "X-RateLimit-Limit": useMinute
+      ? result.minute_limit.toString()
+      : result.hour_limit.toString(),
+    "X-RateLimit-Remaining": useMinute
+      ? result.minute_remaining.toString()
+      : result.hour_remaining.toString(),
+    "X-RateLimit-Reset": useMinute
+      ? result.minute_reset_epoch.toString()
+      : result.hour_reset_epoch.toString(),
+  };
+}
+
+/**
+ * API version header.
+ */
+export function apiVersionHeaders(): Record<string, string> {
+  return {
+    "X-Nod-Version": API_VERSION,
+  };
+}
+
+/**
+ * Combine rate limit headers + API version + CORS into a single object.
+ * Pass null for rlResult when rate limit check was skipped (fail-open).
+ */
+export function standardHeaders(
+  rlResult: RateLimitResult | null,
+  corsHeaders: Record<string, string>,
+): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    ...corsHeaders,
+    ...apiVersionHeaders(),
+    ...(rlResult ? rateLimitHeaders(rlResult) : {}),
+  };
+}
+
+// ---- 429 Response ----
+
+/**
+ * Return a 429 Too Many Requests response with Retry-After header.
+ */
+export function rateLimitExceededResponse(
+  result: RateLimitResult,
+  corsHeaders: Record<string, string>,
+): Response {
+  // Retry-After = seconds until the nearest window resets
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  const retryAfter = Math.max(
+    result.minute_remaining <= 0
+      ? result.minute_reset_epoch - nowEpoch
+      : 0,
+    result.hour_remaining <= 0
+      ? result.hour_reset_epoch - nowEpoch
+      : 0,
+    1, // minimum 1 second
+  );
+
+  return new Response(
+    JSON.stringify({
+      error: "Rate limit exceeded",
+      code: "RATE_LIMIT_EXCEEDED",
+      details: {
+        minute_limit: result.minute_limit,
+        minute_remaining: result.minute_remaining,
+        minute_reset: result.minute_reset_epoch,
+        hour_limit: result.hour_limit,
+        hour_remaining: result.hour_remaining,
+        hour_reset: result.hour_reset_epoch,
+        retry_after: retryAfter,
+      },
+    }),
+    {
+      status: 429,
+      headers: {
+        ...standardHeaders(result, corsHeaders),
+        "Retry-After": retryAfter.toString(),
+      },
+    },
+  );
+}
