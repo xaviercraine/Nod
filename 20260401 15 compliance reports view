@@ -1,0 +1,131 @@
+-- ============================================
+-- NOD — Conversation 15: Compliance Reports View
+-- Migration: get_unsubscribe_requests_paginated() RPC
+-- Deployed: 2026-04-01
+-- ============================================
+
+-- ============================================
+-- STEP 1: get_unsubscribe_requests_paginated() RPC
+-- Returns paginated unsubscribe requests with contact name
+-- for the CRM Sync Log dashboard page.
+-- Supports status filtering (pending/synced/failed).
+-- Computes is_overdue flag for pending requests past deadline.
+-- ============================================
+
+CREATE OR REPLACE FUNCTION get_unsubscribe_requests_paginated(
+  p_tenant_id UUID,
+  p_limit INTEGER DEFAULT 25,
+  p_offset INTEGER DEFAULT 0,
+  p_status_filter TEXT DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_rows JSON;
+  v_total BIGINT;
+BEGIN
+  PERFORM set_config('app.tenant_id', p_tenant_id::text, true);
+
+  SELECT COUNT(*)
+  INTO v_total
+  FROM unsubscribe_requests ur
+  WHERE ur.tenant_id = p_tenant_id
+    AND (p_status_filter IS NULL OR ur.crm_sync_status = p_status_filter::crm_sync_status);
+
+  SELECT COALESCE(json_agg(row_order), '[]'::json)
+  INTO v_rows
+  FROM (
+    SELECT
+      ur.id,
+      ur.contact_id,
+      c.full_name AS contact_name,
+      ur.channel,
+      ur.request_date,
+      ur.deadline_date,
+      ur.crm_sync_status AS status,
+      ur.crm_synced_at AS synced_at,
+      ur.created_at,
+      CASE
+        WHEN ur.crm_sync_status = 'pending' AND ur.deadline_date < NOW() THEN true
+        ELSE false
+      END AS is_overdue
+    FROM unsubscribe_requests ur
+    JOIN contacts c ON c.id = ur.contact_id AND c.tenant_id = ur.tenant_id
+    WHERE ur.tenant_id = p_tenant_id
+      AND (p_status_filter IS NULL OR ur.crm_sync_status = p_status_filter::crm_sync_status)
+    ORDER BY ur.request_date DESC
+    LIMIT p_limit
+    OFFSET p_offset
+  ) row_order;
+
+  RETURN json_build_object(
+    'rows', v_rows,
+    'total', v_total,
+    'limit', p_limit,
+    'offset', p_offset
+  );
+END;
+$$;
+
+-- ============================================
+-- FRONTEND (Lovable dashboard — no SQL)
+--
+-- src/hooks/useComplianceAudit.ts
+--   Fetches get_tenant_audit_summary + get_compliance_score RPCs.
+--   Handles RETURNS TABLE array unwrapping (data[0]).
+--
+-- src/hooks/useUnsubscribeRequests.ts
+--   Fetches get_unsubscribe_requests_paginated RPC.
+--   Manages pagination + status filter state.
+--
+-- src/pages/ComplianceAudit.tsx
+--   /compliance — Full compliance posture page:
+--   Score gauge, 5 component bars, findings cards (critical/warning/info),
+--   consent breakdown donut chart, message checks stacked bar,
+--   CRM sync status, consent expiry alerts (7d/14d/30d).
+--
+-- src/pages/CrmSyncLog.tsx
+--   /compliance/crm-syncs — Paginated CRM sync log:
+--   Unsubscribe requests table with contact name, channel, dates,
+--   status badges (pending/synced/failed/overdue), overdue row highlighting,
+--   status filter buttons, pagination.
+--
+-- AppSidebar updated: "Compliance" link with ShieldCheck icon.
+-- App.tsx updated: /compliance and /compliance/crm-syncs routes.
+-- ============================================
+
+-- ============================================
+-- BUG FIX LOG
+--
+-- get_unsubscribe_requests_paginated() v1: Used ur.status (does not exist).
+-- Column is ur.crm_sync_status. Fixed in v2.
+--
+-- get_unsubscribe_requests_paginated() v2: Used c.first_name || ' ' || c.last_name.
+-- Contacts table has single full_name column. Fixed in v3 to use c.full_name.
+--
+-- useComplianceAudit hook: Both RPCs use RETURNS TABLE, so Supabase JS
+-- returns an array. Hook initially assigned data directly instead of data[0].
+-- All scores showed NaN. Fixed by unwrapping: Array.isArray(data) ? data[0] : data.
+--
+-- ComplianceAudit.tsx: Used tenant?.id but AuthContext exposes tenant?.tenant_id.
+-- Fixed by Lovable during integration.
+-- ============================================
+
+-- ============================================
+-- TEST RESULTS (2026-04-01)
+--
+-- Test A: Compliance page score = 70, 5 component bars match Overview
+--         (31 + 20 + 10 + 8 + 1 = 70). ✅
+-- Test B: 6 findings: 2 CRITICAL (3 no consent, 3 expired+recent checks),
+--         2 WARNING (7 missing evidence, 1 incomplete profile),
+--         2 INFO (1 expiring 14d, 1 expiring 30d). ✅
+-- Test C: Consent breakdown donut: 10 with consent (77%),
+--         3 without (23%), total 13. ✅
+-- Test D: Message checks: 19 pass, 7 warning, 8 fail. ✅
+-- Test E: CRM sync status: 2 pending, 0 overdue. ✅
+-- Test F: CRM sync log: 3 requests (Bob Martinez pending,
+--         Frank Patel pending, Alice Chen synced), status badges,
+--         overdue highlighting, back link. ✅
+-- ============================================
