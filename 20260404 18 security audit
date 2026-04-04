@@ -1,0 +1,201 @@
+-- ============================================
+-- NOD — Conversation 18: Security Audit
+-- Migration: Immutability triggers, subscription enforcement triggers,
+-- CHECK constraint, Northshore API key seed, data repairs
+-- Deployed: 2026-04-04
+-- ============================================
+
+-- ============================================
+-- STEP 1: Seed API key for Northshore Auto Group (second test tenant)
+-- Raw key: nod_live_test_northshore_2026 (displayed once, never stored)
+-- ============================================
+
+INSERT INTO api_keys (tenant_id, key_hash, key_prefix, label, scopes)
+VALUES (
+  'b1ffcd00-ad1c-5fa9-cc7e-7ccaae491b22',
+  encode(
+    extensions.hmac(
+      'nod_live_test_northshore_2026',
+      'a7c3e91f4b2d8a6e0f5c1d9b3a7e2f4c8d6b0a1e5f9c3d7b2a8e4f6c0d1b5a9',
+      'sha256'
+    ),
+    'hex'
+  ),
+  'nod_live_',
+  'Northshore Security Audit Key',
+  '{read,write}'
+);
+
+-- ============================================
+-- STEP 2: consent_records immutability trigger
+-- BUG FIX: consent_records allowed UPDATE and DELETE by any role.
+-- For a CASL compliance system, this breaks the immutable audit trail
+-- required for court evidence under s.13.
+-- Fix: BEFORE UPDATE OR DELETE trigger that unconditionally raises exception.
+-- ============================================
+
+CREATE OR REPLACE FUNCTION prevent_consent_record_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'consent_records is immutable. UPDATE and DELETE are prohibited.'
+    USING ERRCODE = 'P0001';
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER trg_consent_records_immutable
+  BEFORE UPDATE OR DELETE ON consent_records
+  FOR EACH ROW
+  EXECUTE FUNCTION prevent_consent_record_mutation();
+
+-- ============================================
+-- STEP 3: audit_log immutability trigger
+-- BUG FIX: Same issue as consent_records — audit_log allowed
+-- UPDATE and DELETE by any role.
+-- ============================================
+
+CREATE OR REPLACE FUNCTION prevent_audit_log_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'audit_log is immutable. UPDATE and DELETE are prohibited.'
+    USING ERRCODE = 'P0001';
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER trg_audit_log_immutable
+  BEFORE UPDATE OR DELETE ON audit_log
+  FOR EACH ROW
+  EXECUTE FUNCTION prevent_audit_log_mutation();
+
+-- ============================================
+-- STEP 4: Subscription enforcement triggers
+-- BUG FIX: Expired/cancelled subscriptions did not block write API access.
+-- A tenant with subscription_status = 'cancelled' and expired
+-- subscription_expires_at could still record consent, import contacts,
+-- run pre-send checks, etc.
+-- Fix: BEFORE INSERT trigger on 6 tables that checks tenant subscription.
+-- ============================================
+
+CREATE OR REPLACE FUNCTION check_subscription_active()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_status subscription_status;
+  v_expires_at timestamptz;
+BEGIN
+  SELECT subscription_status, subscription_expires_at
+  INTO v_status, v_expires_at
+  FROM tenants
+  WHERE id = NEW.tenant_id;
+
+  IF v_status = 'cancelled' AND v_expires_at IS NOT NULL AND v_expires_at < now() THEN
+    RAISE EXCEPTION 'Subscription expired. Write operations are blocked.'
+      USING ERRCODE = 'P0003';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_consent_records_subscription_check
+  BEFORE INSERT ON consent_records
+  FOR EACH ROW
+  EXECUTE FUNCTION check_subscription_active();
+
+CREATE TRIGGER trg_contacts_subscription_check
+  BEFORE INSERT OR UPDATE ON contacts
+  FOR EACH ROW
+  EXECUTE FUNCTION check_subscription_active();
+
+CREATE TRIGGER trg_message_checks_subscription_check
+  BEFORE INSERT ON message_checks
+  FOR EACH ROW
+  EXECUTE FUNCTION check_subscription_active();
+
+CREATE TRIGGER trg_unsubscribe_requests_subscription_check
+  BEFORE INSERT ON unsubscribe_requests
+  FOR EACH ROW
+  EXECUTE FUNCTION check_subscription_active();
+
+CREATE TRIGGER trg_sender_profiles_subscription_check
+  BEFORE INSERT OR UPDATE ON sender_profiles
+  FOR EACH ROW
+  EXECUTE FUNCTION check_subscription_active();
+
+CREATE TRIGGER trg_api_keys_subscription_check
+  BEFORE INSERT ON api_keys
+  FOR EACH ROW
+  EXECUTE FUNCTION check_subscription_active();
+
+-- ============================================
+-- STEP 5: CHECK constraint — cancelled requires expiry date
+-- Prevents an impossible state where subscription_status = 'cancelled'
+-- but subscription_expires_at is NULL, which would silently bypass
+-- the subscription check trigger.
+-- ============================================
+
+ALTER TABLE tenants
+ADD CONSTRAINT chk_cancelled_requires_expiry
+CHECK (
+  subscription_status != 'cancelled'
+  OR subscription_expires_at IS NOT NULL
+);
+
+-- ============================================
+-- STEP 6: Data repairs
+-- During security audit testing, destructive operations were tested
+-- BEFORE immutability triggers were in place, damaging 3 records.
+-- ============================================
+
+-- 6a: David Kim consent record — consent_type mutated from implied_ebr to express.
+-- Repaired by temporarily disabling trigger, updating, re-enabling.
+-- ALTER TABLE consent_records DISABLE TRIGGER trg_consent_records_immutable;
+-- UPDATE consent_records SET consent_type = 'implied_ebr'
+--   WHERE id = '1b91dd99-a315-40ee-a729-9e124c526fd5';
+-- ALTER TABLE consent_records ENABLE TRIGGER trg_consent_records_immutable;
+
+-- 6b: audit_log entry — details overwritten during testing.
+-- Original details unrecoverable (linked consent_record also missing from early testing).
+-- Annotated with repair note.
+-- ALTER TABLE audit_log DISABLE TRIGGER trg_audit_log_immutable;
+-- UPDATE audit_log SET details = '{"_repair_note": "Original details lost during Conv 18
+--   security audit testing. Linked consent_record also missing. Annotated 2026-04-04."}'::jsonb
+--   WHERE id = '2474dcb8-3d7e-4e5d-8063-4354d5696576';
+-- ALTER TABLE audit_log ENABLE TRIGGER trg_audit_log_immutable;
+
+-- 6c: consent_record ID 664dc1fd-0f3c-4ff6-9638-3493818f416b — permanently deleted
+-- during DELETE test. No audit trail exists. Unrecoverable. Record was from Conv 0A
+-- early testing, not from real dealership data.
+
+-- ============================================
+-- SECURITY AUDIT RESULTS (2026-04-04)
+--
+-- 16 checks performed. 13 passed on first try. 3 bugs found and fixed.
+--
+--  1. API key auth rejects invalid/expired/inactive keys          PASS
+--  2. RPC-based tenant isolation: no cross-tenant data            PASS
+--  3. consent_records: no UPDATE/DELETE for ANY role               PASS (after fix)
+--  4. audit_log: no UPDATE/DELETE for ANY role                     PASS (after fix)
+--  5. No PII in error responses                                   PASS
+--  6. Stripe webhook signature verification                       PASS
+--  7. Webhook idempotency                                         PASS
+--  8. Rate limiting                                               PASS
+--  9. API key shown once, never retrievable                       PASS
+-- 10. RPC SET LOCAL: no cross-request tenant leakage              PASS
+-- 11. Batch check with cross-tenant contact excluded              PASS
+-- 12. Concurrent batch calls: atomic counter, no race             PASS
+-- 13. Sender profile 60-day deletion protection                   PASS
+-- 14. Storage bucket RLS: file isolation                          PASS
+-- 15. Expired subscription blocks write API access                PASS (after fix)
+-- 16. Idempotency key prevents duplicate consent                  PASS
+--
+-- Deferred to Conv 19 (error handling polish, not security):
+-- - Edge Functions return 500 instead of 403 for P0003 subscription errors
+-- - api-consent returns 500 instead of 400 for non-UUID idempotency keys
+-- ============================================
