@@ -1,0 +1,522 @@
+// ============================================
+// NOD — api-sender-profiles/index.ts
+// Conversation 6: Sender Profile CRUD
+//
+// POST   /sender-profiles        — Create sender profile
+// GET    /sender-profiles        — List all profiles for tenant
+// GET    /sender-profiles/{id}   — Get single profile
+// PATCH  /sender-profiles/{id}   — Update profile
+// DELETE /sender-profiles/{id}   — Delete with 60-day protection
+//
+// Every endpoint: HMAC auth, RPC for data access, audit trail,
+// no PII in errors, try/catch with founder alert on failure.
+// ============================================
+
+import { requireAuth } from "../_shared/auth.ts";
+import { getSupabaseClient } from "../_shared/supabase.ts";
+import { insertAuditLog, getClientIp } from "../_shared/audit.ts";
+import { alertFounder } from "../_shared/alerting.ts";
+import type { AuthResult, SenderProfile } from "../_shared/types.ts";
+
+
+import {
+  checkRateLimit,
+  rateLimitExceededResponse,
+  rateLimitHeaders,
+  apiVersionHeaders,
+} from "../_shared/rate-limiter.ts";
+// ---- CORS Headers ----
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, content-type, x-nod-version",
+  "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
+};
+
+// ---- JSON Response Helpers ----
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders },
+  });
+}
+
+function errorResponse(
+  error: string,
+  code: string,
+  status: number,
+  details?: Record<string, unknown>,
+): Response {
+  return jsonResponse({ error, code, ...(details ? { details } : {}) }, status);
+}
+
+// ---- Path Parsing (segment-based, same pattern as api-unsubscribe) ----
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Extract a profile UUID from the URL path.
+ * Looks for the last segment that matches UUID format.
+ * Returns null if no UUID found (i.e. list/create routes).
+ */
+function extractProfileId(pathname: string): string | null {
+  const segments = pathname.split("/").filter(Boolean);
+  // Check the last segment for a UUID
+  const lastSegment = segments[segments.length - 1];
+  if (lastSegment && UUID_PATTERN.test(lastSegment)) {
+    return lastSegment;
+  }
+  return null;
+}
+
+// ---- Route: POST /sender-profiles ----
+
+async function handleCreate(
+  request: Request,
+  auth: AuthResult,
+): Promise<Response> {
+  const body = await request.json();
+
+  const {
+    sender_name,
+    mailing_address,
+    on_behalf_of,
+    phone,
+    email,
+    website_url,
+    is_default,
+  } = body;
+
+  // ---- Validation ----
+
+  if (!sender_name || typeof sender_name !== "string" || sender_name.trim() === "") {
+    return errorResponse("sender_name is required", "MISSING_FIELD", 400);
+  }
+
+  if (
+    !mailing_address ||
+    typeof mailing_address !== "string" ||
+    mailing_address.trim() === ""
+  ) {
+    return errorResponse("mailing_address is required", "MISSING_FIELD", 400);
+  }
+
+  if (!phone && !email && !website_url) {
+    return errorResponse(
+      "At least one contact method (phone, email, or website_url) is required",
+      "MISSING_CONTACT_METHOD",
+      400,
+    );
+  }
+
+  // ---- RPC call ----
+
+  const supabase = getSupabaseClient();
+
+  const { data, error } = await supabase.rpc("create_sender_profile", {
+    p_tenant_id: auth.tenantId,
+    p_sender_name: sender_name.trim(),
+    p_mailing_address: mailing_address.trim(),
+    p_on_behalf_of: on_behalf_of?.trim() || null,
+    p_phone: phone?.trim() || null,
+    p_email: email?.trim() || null,
+    p_website_url: website_url?.trim() || null,
+    p_is_default: is_default ?? false,
+  });
+
+  if (error) {
+    if (error.code === "P0003") {
+      return errorResponse(
+        "Subscription expired. Write operations are blocked.",
+        "SUBSCRIPTION_EXPIRED",
+        403,
+      );
+    }
+
+    console.error("create_sender_profile RPC error:", error.message);
+    await alertFounder(
+      "Create Sender Profile Failed",
+      `<p>Tenant: ${auth.tenantId}</p><p>Error: ${error.message}</p>`,
+    );
+    return errorResponse(
+      "Failed to create sender profile",
+      "CREATE_FAILED",
+      500,
+    );
+  }
+
+  const profile: SenderProfile = Array.isArray(data) ? data[0] : data;
+
+  // ---- Audit log ----
+
+  await insertAuditLog({
+    tenantId: auth.tenantId,
+    action: "message_validated",
+    entityType: "sender_profile",
+    entityId: profile.id,
+    details: {
+      operation: "create",
+      sender_name: profile.sender_name,
+      on_behalf_of: profile.on_behalf_of,
+      is_default: profile.is_default,
+    },
+    apiKeyId: auth.apiKeyId,
+    ipAddress: getClientIp(request),
+  });
+
+  return jsonResponse(profile, 201);
+}
+
+// ---- Route: GET /sender-profiles ----
+
+async function handleList(
+  auth: AuthResult,
+): Promise<Response> {
+  const supabase = getSupabaseClient();
+
+  const { data, error } = await supabase.rpc("get_sender_profiles", {
+    p_tenant_id: auth.tenantId,
+  });
+
+  if (error) {
+    console.error("get_sender_profiles RPC error:", error.message);
+    await alertFounder(
+      "List Sender Profiles Failed",
+      `<p>Tenant: ${auth.tenantId}</p><p>Error: ${error.message}</p>`,
+    );
+    return errorResponse(
+      "Failed to retrieve sender profiles",
+      "QUERY_FAILED",
+      500,
+    );
+  }
+
+  const profiles: SenderProfile[] = Array.isArray(data) ? data : [];
+
+  return jsonResponse({ sender_profiles: profiles, count: profiles.length });
+}
+
+// ---- Route: GET /sender-profiles/{id} ----
+
+async function handleGetById(
+  auth: AuthResult,
+  profileId: string,
+): Promise<Response> {
+  const supabase = getSupabaseClient();
+
+  const { data, error } = await supabase.rpc("get_sender_profile_by_id", {
+    p_tenant_id: auth.tenantId,
+    p_profile_id: profileId,
+  });
+
+  if (error) {
+    console.error("get_sender_profile_by_id RPC error:", error.message);
+    await alertFounder(
+      "Get Sender Profile Failed",
+      `<p>Tenant: ${auth.tenantId}</p><p>Profile: ${profileId}</p><p>Error: ${error.message}</p>`,
+    );
+    return errorResponse(
+      "Failed to retrieve sender profile",
+      "QUERY_FAILED",
+      500,
+    );
+  }
+
+  const profiles: SenderProfile[] = Array.isArray(data) ? data : [];
+
+  if (profiles.length === 0) {
+    return errorResponse(
+      "Sender profile not found",
+      "NOT_FOUND",
+      404,
+    );
+  }
+
+  return jsonResponse(profiles[0]);
+}
+
+// ---- Route: PATCH /sender-profiles/{id} ----
+
+async function handleUpdate(
+  request: Request,
+  auth: AuthResult,
+  profileId: string,
+): Promise<Response> {
+  const body = await request.json();
+
+  const {
+    sender_name,
+    on_behalf_of,
+    mailing_address,
+    phone,
+    email,
+    website_url,
+    is_default,
+  } = body;
+
+  // At least one field must be provided
+  if (
+    sender_name === undefined &&
+    on_behalf_of === undefined &&
+    mailing_address === undefined &&
+    phone === undefined &&
+    email === undefined &&
+    website_url === undefined &&
+    is_default === undefined
+  ) {
+    return errorResponse(
+      "At least one field must be provided for update",
+      "EMPTY_UPDATE",
+      400,
+    );
+  }
+
+  // ---- Build RPC params ----
+  // '__UNCHANGED__' sentinel for nullable fields not included in the PATCH body.
+  // null in the PATCH body means "set to NULL".
+
+  const supabase = getSupabaseClient();
+
+  const { data, error } = await supabase.rpc("update_sender_profile", {
+    p_tenant_id: auth.tenantId,
+    p_profile_id: profileId,
+    p_sender_name: sender_name !== undefined ? sender_name?.trim() || null : null,
+    p_on_behalf_of:
+      on_behalf_of !== undefined
+        ? on_behalf_of === null
+          ? null
+          : on_behalf_of.trim() || null
+        : "__UNCHANGED__",
+    p_mailing_address:
+      mailing_address !== undefined ? mailing_address?.trim() || null : null,
+    p_phone:
+      phone !== undefined
+        ? phone === null
+          ? null
+          : phone.trim() || null
+        : "__UNCHANGED__",
+    p_email:
+      email !== undefined
+        ? email === null
+          ? null
+          : email.trim() || null
+        : "__UNCHANGED__",
+    p_website_url:
+      website_url !== undefined
+        ? website_url === null
+          ? null
+          : website_url.trim() || null
+        : "__UNCHANGED__",
+    p_is_default: is_default !== undefined ? is_default : null,
+  });
+
+  if (error) {
+    if (error.code === "P0003") {
+      return errorResponse(
+        "Subscription expired. Write operations are blocked.",
+        "SUBSCRIPTION_EXPIRED",
+        403,
+      );
+    }
+
+    console.error("update_sender_profile RPC error:", error.message);
+
+    if (error.message.includes("not found")) {
+      return errorResponse("Sender profile not found", "NOT_FOUND", 404);
+    }
+    if (error.message.includes("contact method")) {
+      return errorResponse(
+        "At least one contact method (phone, email, or website_url) is required",
+        "MISSING_CONTACT_METHOD",
+        400,
+      );
+    }
+
+    await alertFounder(
+      "Update Sender Profile Failed",
+      `<p>Tenant: ${auth.tenantId}</p><p>Profile: ${profileId}</p><p>Error: ${error.message}</p>`,
+    );
+    return errorResponse(
+      "Failed to update sender profile",
+      "UPDATE_FAILED",
+      500,
+    );
+  }
+
+  const profile: SenderProfile = Array.isArray(data) ? data[0] : data;
+
+  // ---- Audit log ----
+
+  await insertAuditLog({
+    tenantId: auth.tenantId,
+    action: "message_validated",
+    entityType: "sender_profile",
+    entityId: profile.id,
+    details: {
+      operation: "update",
+      updated_fields: Object.keys(body),
+    },
+    apiKeyId: auth.apiKeyId,
+    ipAddress: getClientIp(request),
+  });
+
+  return jsonResponse(profile);
+}
+
+// ---- Route: DELETE /sender-profiles/{id} ----
+
+async function handleDelete(
+  request: Request,
+  auth: AuthResult,
+  profileId: string,
+): Promise<Response> {
+  const supabase = getSupabaseClient();
+
+  const { error } = await supabase.rpc("delete_sender_profile", {
+    p_tenant_id: auth.tenantId,
+    p_profile_id: profileId,
+  });
+
+  if (error) {
+    console.error("delete_sender_profile RPC error:", error.message);
+
+    if (error.message.includes("not found")) {
+      return errorResponse("Sender profile not found", "NOT_FOUND", 404);
+    }
+    if (error.message.includes("60 days")) {
+      return errorResponse(
+        "Cannot delete: sender profile referenced by message checks within the last 60 days",
+        "DELETE_PROTECTED",
+        409,
+      );
+    }
+
+    await alertFounder(
+      "Delete Sender Profile Failed",
+      `<p>Tenant: ${auth.tenantId}</p><p>Profile: ${profileId}</p><p>Error: ${error.message}</p>`,
+    );
+    return errorResponse(
+      "Failed to delete sender profile",
+      "DELETE_FAILED",
+      500,
+    );
+  }
+
+  // ---- Audit log ----
+
+  await insertAuditLog({
+    tenantId: auth.tenantId,
+    action: "message_validated",
+    entityType: "sender_profile",
+    entityId: profileId,
+    details: { operation: "delete" },
+    apiKeyId: auth.apiKeyId,
+    ipAddress: getClientIp(request),
+  });
+
+  return jsonResponse({ deleted: true, profile_id: profileId });
+}
+
+// ---- Response Header Augmentation ----
+
+function addHeaders(
+  response: Response,
+  extraHeaders: Record<string, string>,
+): Response {
+  const newHeaders = new Headers(response.headers);
+  for (const [key, value] of Object.entries(extraHeaders)) {
+    newHeaders.set(key, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  });
+}
+
+// ---- Main Handler ----
+
+Deno.serve(async (request: Request) => {
+  // Handle CORS preflight
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: { ...corsHeaders, ...apiVersionHeaders() },
+    });
+  }
+
+  try {
+    // Authenticate
+    const auth = await requireAuth(request);
+    if (auth instanceof Response) return addHeaders(auth, apiVersionHeaders());
+
+    // Rate limit check (after auth so we have the API key ID)
+    const rlResult = await checkRateLimit(auth.apiKeyId, auth.tenantId);
+    if (rlResult && !rlResult.allowed) {
+      return rateLimitExceededResponse(rlResult, corsHeaders);
+    }
+
+    // Build extra headers: rate limit + API version
+    const extraHeaders: Record<string, string> = {
+      ...apiVersionHeaders(),
+      ...(rlResult ? rateLimitHeaders(rlResult) : {}),
+    };
+
+    const url = new URL(request.url);
+    const profileId = extractProfileId(url.pathname);
+
+    // POST /sender-profiles — Create
+    if (request.method === "POST" && !profileId) {
+      return addHeaders(await handleCreate(request, auth), extraHeaders);
+    }
+
+    // GET /sender-profiles — List all
+    if (request.method === "GET" && !profileId) {
+      return addHeaders(await handleList(auth), extraHeaders);
+    }
+
+    // GET /sender-profiles/{id} — Get single
+    if (request.method === "GET" && profileId) {
+      return addHeaders(await handleGetById(auth, profileId), extraHeaders);
+    }
+
+    // PATCH /sender-profiles/{id} — Update
+    if (request.method === "PATCH" && profileId) {
+      return addHeaders(await handleUpdate(request, auth, profileId), extraHeaders);
+    }
+
+    // DELETE /sender-profiles/{id} — Delete
+    if (request.method === "DELETE" && profileId) {
+      return addHeaders(await handleDelete(request, auth, profileId), extraHeaders);
+    }
+
+    return addHeaders(errorResponse("Method not allowed", "METHOD_NOT_ALLOWED", 405), extraHeaders);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+
+    if (message.includes("P0003") || message.includes("Subscription expired")) {
+      return addHeaders(
+        errorResponse(
+          "Subscription expired. Write operations are blocked.",
+          "SUBSCRIPTION_EXPIRED",
+          403,
+        ),
+        apiVersionHeaders(),
+      );
+    }
+
+    console.error("Unhandled error in api-sender-profiles:", message);
+
+    await alertFounder(
+      "api-sender-profiles Unhandled Error",
+      `<p>Error: ${message}</p><p>Stack: ${err instanceof Error ? err.stack : "N/A"}</p>`,
+    );
+
+    return addHeaders(
+      errorResponse("Internal server error", "INTERNAL_ERROR", 500),
+      apiVersionHeaders(),
+    );
+  }
+});
