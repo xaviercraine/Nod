@@ -1,0 +1,172 @@
+# Nod — Pilot Monitoring Plan: Mills Motors
+
+**Pilot start date:** April 4, 2026
+**Pilot end date:** April 18, 2026
+**Pilot contact:** Jason Mills (owner), Mills Motors
+**Nod operator:** Xavier Craine
+
+---
+
+## Monitoring Schedule
+
+### Daily (automated — no action required unless alerts fire)
+
+These run automatically via pg_cron:
+
+- **Consent expiry scan** — checks all contacts for expiring consent at 30/14/7-day thresholds, writes alerts to audit_log
+- **Unsubscribe deadline monitor** — flags any unsubscribe requests approaching or past the 10-business-day deadline
+- **Message counter** — tracks messages against the monthly limit (resets on the 1st of each month)
+
+**What to watch for:**
+- Any overdue CRM sync alerts (crm_sync_status = 'pending' past deadline_date) — this means an unsubscribe request wasn't actioned in the DMS within the legal window
+- Expiry alerts clustering — if many contacts expire at once, the dealership needs a re-consent campaign
+
+### Every 2–3 Days (manual check)
+
+Run the compliance audit and compare to the baseline:
+
+```
+GET /api-compliance/audit
+Authorization: Bearer {api_key}
+```
+
+Track these numbers across the pilot:
+
+| Metric | Baseline (Apr 4) | Check 1 (Apr 7) | Check 2 (Apr 10) | Check 3 (Apr 14) | End (Apr 18) |
+|---|---|---|---|---|---|
+| Overall score | 68 | | | | |
+| Consent coverage % | 68.33 | | | | |
+| Contacts with no consent | 165 | | | | |
+| Checks pass rate (30d) | 61.7% | | | | |
+| Pending CRM syncs | 3 | | | | |
+| Overdue CRM syncs | 0 | | | | |
+| Expiring 7d | 1 | | | | |
+
+**What you're looking for:**
+- Score trending up (or at least stable) — means the dealership is using Nod and acting on findings
+- Pass rate improving — means they're checking before sending and not attempting non-compliant sends
+- Pending CRM syncs staying low — means they're processing unsubscribes in their DMS
+- No overdue syncs — critical; overdue = potential CASL violation
+
+### Week 1 Check-In (April 11)
+
+**Format:** 15-minute phone/video call with Jason
+**Agenda:**
+1. Walk through the current compliance score — what changed since onboarding?
+2. Ask about the dashboard — is it clear? Anything confusing?
+3. Ask about the pre-send check — has anyone on the team used it? What was the experience?
+4. Ask about expiry alerts — did they notice the consent expiring notifications?
+5. Any contacts they want to add or update?
+6. Any questions about what they can and can't send?
+
+### Week 2 / Pilot End (April 18)
+
+**Format:** 30-minute call with Jason
+**Agenda:**
+1. Final compliance score review — trend over the 2 weeks
+2. Feedback collection (use the template below)
+3. Discuss next steps: continue on free pilot, convert to paid, or issues to resolve first
+4. If continuing: schedule monthly check-ins
+5. Generate a fresh compliance program document for their records
+
+---
+
+## Feedback Collection Template
+
+Ask these questions at the end-of-pilot call. Record answers verbatim — this becomes your product development backlog and your case study material.
+
+### Setup Experience
+
+1. How would you describe the onboarding process? Was anything confusing or unclear?
+2. How long did the DMS export take on your end? Was the data format we needed easy to pull from your system?
+3. Which DMS are you using? (CDK, Reynolds and Reynolds, Dealertrack, DealerSocket, other)
+
+### Daily Use
+
+4. How often did you or your team check the compliance dashboard this week?
+5. Did anyone run a pre-send check before sending a marketing email? What was that like?
+6. Did you receive any consent expiry alerts? Were they useful or noisy?
+7. Did any customers unsubscribe during the pilot? How did the process work?
+
+### Value Perception
+
+8. Before Nod, how did you handle CASL compliance? (Be specific — did you have a process, or was it "we just send emails"?)
+9. What's the single most valuable thing Nod showed you that you didn't know before?
+10. If the CRTC contacted you tomorrow, how confident would you feel about your compliance posture now versus two weeks ago? (Scale of 1–10, before and after)
+11. Would you recommend Nod to another dealership? Why or why not?
+
+### Pricing & Willingness to Pay
+
+12. If Nod cost $299/month, would that feel reasonable for what it does?
+13. Is there a feature that would make the price feel like a no-brainer?
+14. Would you prefer monthly or annual billing?
+
+### Feature Requests
+
+15. What's the one thing Nod doesn't do that you wish it did?
+16. Is there anything in the dashboard that felt unnecessary or cluttered?
+17. Would your team prefer to interact with Nod through the dashboard, or would you want it integrated directly into your DMS?
+
+---
+
+## Incident Response During Pilot
+
+If anything goes wrong during the pilot:
+
+### Unsubscribe not processing
+1. Check unsubscribe_requests table for the contact — is the record there?
+2. Check crm_sync_status — if 'pending', the dealership needs to action it in their DMS
+3. Verify the consent withdrawal record was created in consent_records
+4. Confirm the contact's consent status is now 'withdrawn' via GET /api-consent/status
+
+### Pre-send check returning unexpected results
+1. Check the contact's consent status: GET /api-consent/status?contact_id={id}&channel=email
+2. Check if consent has expired (days_until_expiry could be negative)
+3. Check if a withdrawal exists that overrides prior consent
+4. Check the message classification — is it correctly identified as CEM vs. exempt?
+
+### Dashboard not loading or showing stale data
+1. Check Edge Function health: GET /health-check
+2. Check if the compliance score cron has run (compliance_reports table, most recent entry)
+3. Verify the tenant_users mapping exists for the dashboard user
+
+### Score dropping unexpectedly
+1. Run the audit and compare findings to the previous check
+2. Most common cause: consent expirations (implied_ebr contacts passing the 2-year mark)
+3. Second most common: failed pre-send checks being recorded (they count against the pass rate)
+
+---
+
+## Pilot Success Criteria
+
+The pilot is successful if:
+
+- [ ] Dealership staff can log in to the dashboard and understand their compliance posture
+- [ ] At least one pre-send check was run by someone other than Xavier
+- [ ] Compliance score is stable or improving (not declining due to unaddressed issues)
+- [ ] No overdue CRM syncs (all unsubscribes processed within the legal window)
+- [ ] Jason can articulate what Nod does in his own words (case study readiness)
+- [ ] Jason would recommend Nod to another dealership (NPS signal)
+- [ ] No unresolved bugs or data integrity issues
+
+---
+
+## Post-Pilot Actions
+
+Based on pilot outcomes:
+
+**If successful (all criteria met):**
+- Convert Mills Motors to a permanent free account (founder's pilot)
+- Use Jason's feedback answers as the foundation for the case study
+- Use the before/after compliance score as proof data for the Paul Cross pitch
+- Begin preparing sales materials per the execution plan (Month 5)
+
+**If partially successful (some issues):**
+- Extend the pilot by 1 week
+- Address specific issues identified
+- Re-run the feedback collection after fixes
+
+**If unsuccessful (major issues):**
+- Document what went wrong — is it product, data quality, or user understanding?
+- Fix before attempting any external sales
+- This is a feature of building in the open with a friendly pilot, not a failure
