@@ -1,0 +1,204 @@
+# Nod Build Reference — Lessons & Guardrails
+
+Compiled after Conversation 18 (Security Audit). This document captures every bug found, the root cause, the fix applied, and the principle to prevent recurrence. Attach to every future conversation alongside NODCHECK.pdf.
+
+---
+
+## 1. Immutability Must Be Enforced at the Database Level
+
+**What happened:** consent_records and audit_log — the two tables that form Nod's legal evidence chain — had no protection against UPDATE or DELETE. Any role, including postgres superuser, could silently rewrite or destroy compliance records.
+
+**Root cause:** The Conv 0A schema deployment created the tables and the execution plan stated they should be immutable, but no trigger or constraint was ever added to enforce it. The assumption was documented but never implemented.
+
+**Fix applied:** BEFORE UPDATE OR DELETE triggers on both tables that raise an exception unconditionally.
+
+**Principle: If a table must be immutable, add a trigger in the same migration that creates the table. Documentation is not enforcement. If a rule matters for legal or compliance reasons, it must exist as a database constraint or trigger — never as an application-layer assumption.**
+
+---
+
+## 2. Subscription Enforcement Must Be Database-Level
+
+**What happened:** A tenant with subscription_status = 'cancelled' and an expired subscription_expires_at could still call write API endpoints (record consent, import contacts, run pre-send checks, etc.) with no restriction.
+
+**Root cause:** The auth module (auth.ts) resolves the API key to a tenant_id but never checks subscription status. No Edge Function checked it either. The billing webhook correctly updates the tenant's status, but nothing downstream consumed that status for access control.
+
+**Fix applied:** A BEFORE INSERT (or INSERT OR UPDATE) trigger on 6 tables (consent_records, contacts, message_checks, unsubscribe_requests, sender_profiles, api_keys) that looks up the tenant's subscription status and blocks writes if cancelled + expired.
+
+**Residual issues (deferred to Conv 19):**
+- Edge Functions catch the trigger's P0003 error generically and return HTTP 500 instead of 403 with a clear SUBSCRIPTION_EXPIRED code.
+- If subscription_status = 'cancelled' but subscription_expires_at is NULL (due to a webhook bug or manual edit), the trigger silently allows writes. A CHECK constraint was added to prevent this state: cancelled status now requires a non-null expiry date.
+
+**Principle: Access control that depends on billing state must be enforced at the database level, not the application layer. Edge Functions come and go; triggers persist. When adding a billing status field, always ask: "What should be blocked when this status changes?" and implement the block in the same migration.**
+
+---
+
+## 3. Every New Table Needs a Subscription Check
+
+**When adding a new tenant-scoped table in the future**, add this trigger:
+
+```sql
+CREATE TRIGGER trg_{table_name}_subscription_check
+  BEFORE INSERT ON {table_name}
+  FOR EACH ROW
+  EXECUTE FUNCTION check_subscription_active();
+```
+
+The function already exists. It checks `tenants.subscription_status = 'cancelled' AND subscription_expires_at < now()`.
+
+Tables currently protected: consent_records, contacts, message_checks, unsubscribe_requests, sender_profiles, api_keys.
+
+---
+
+## 4. Never Test Destructive Operations on Real Data Without a Safety Net
+
+**What happened:** During the security audit, we ran UPDATE and DELETE tests on consent_records and audit_log BEFORE adding immutability triggers. This resulted in:
+
+- One consent record permanently deleted (ID 664dc1fd... — unrecoverable, no audit trail)
+- One consent record's consent_type mutated from implied_ebr to express (David Kim — repaired)
+- One audit_log entry's details overwritten (annotated, original unrecoverable)
+
+**Principle: When testing whether destructive operations are blocked, always add the protection FIRST, then verify it works. If you must test that an unprotected table is vulnerable, use a dedicated test row created for that purpose, never LIMIT 1 on production data. The sequence should be:**
+
+1. Create a test row specifically for the audit
+2. Attempt the destructive operation on that test row
+3. Confirm it succeeded (proving the vulnerability)
+4. Delete the test row
+5. Deploy the fix
+6. Verify the fix blocks the operation
+
+---
+
+## 5. LIMIT 1 Without ORDER BY Is Non-Deterministic
+
+**What happened:** We used `WHERE tenant_id = ... LIMIT 1` to pick a test record for UPDATE and DELETE tests. PostgreSQL's row selection without ORDER BY is non-deterministic — it can return different rows on different executions. This made it impossible to identify which record was mutated.
+
+**Principle: Never use LIMIT without ORDER BY when the specific row matters. Always target a known ID for test operations.**
+
+---
+
+## 6. Error Codes Must Be Specific, Not Generic
+
+**What happened:** Two distinct error conditions — expired subscription and invalid idempotency key format — both return HTTP 500 with generic error codes (INSERT_FAILED, INTERNAL_ERROR). An integrator seeing these errors has no way to diagnose the problem.
+
+**Root cause:** All Edge Functions use a catch-all error handler that wraps any database exception as a 500. Database errors with specific ERRCODE values (P0003 for subscription, 22P02 for invalid UUID cast) are not inspected.
+
+**Deferred fix (Conv 19):** Each Edge Function's catch block should inspect the PostgreSQL error code and return appropriate HTTP status + error code:
+- P0003 → 403 SUBSCRIPTION_EXPIRED
+- 22P02 on idempotency_key → 400 INVALID_IDEMPOTENCY_KEY
+
+**Principle: When adding a database trigger or constraint that raises a custom ERRCODE, always update the Edge Function error handlers in the same conversation to translate that code into a meaningful API response. The database and API layers are not independent — a new database error needs a corresponding API error.**
+
+---
+
+## 7. The Audit-Then-Fix Sequence
+
+When running a security audit or any verification pass, follow this order:
+
+1. **Test** — verify the expected behavior
+2. **If it fails** — document the finding
+3. **Fix** — deploy the database-level fix
+4. **Re-test** — verify the fix works
+5. **Verify no side effects** — confirm related functionality still works (e.g., reads still work when writes are blocked)
+6. **Revert test data** — clean up any state changes from testing
+
+Never skip step 6. Test artifacts left in production data compound over conversations.
+
+---
+
+## 8. CHECK Constraints for State Invariants
+
+**What happened:** The cancelled subscription status should always have a non-null subscription_expires_at, but nothing enforced this. A webhook bug or manual edit could create an impossible state that silently bypasses the subscription check trigger.
+
+**Fix applied:**
+```sql
+ALTER TABLE tenants
+ADD CONSTRAINT chk_cancelled_requires_expiry
+CHECK (
+  subscription_status != 'cancelled'
+  OR subscription_expires_at IS NOT NULL
+);
+```
+
+**Principle: When two columns have a logical dependency (if A then B must not be null), enforce it with a CHECK constraint. Don't rely on application code to maintain the invariant — any direct SQL edit will bypass it.**
+
+---
+
+## 9. Trigger Disable/Enable for Data Repairs
+
+When immutability triggers are in place and a data repair is needed:
+
+```sql
+-- 1. Disable the specific trigger
+ALTER TABLE {table} DISABLE TRIGGER {trigger_name};
+
+-- 2. Perform the repair (targeted, with RETURNING to confirm)
+UPDATE {table} SET ... WHERE id = '{specific_id}' RETURNING id, {changed_columns};
+
+-- 3. Re-enable immediately
+ALTER TABLE {table} ENABLE TRIGGER {trigger_name};
+
+-- 4. Verify trigger is active
+UPDATE {table} SET notes = 'test' WHERE id = '{specific_id}';
+-- Should fail with immutability error
+```
+
+Never leave a trigger disabled. Always verify re-enablement in the same SQL session.
+
+---
+
+## 10. Supabase SQL Editor Behavior Notes
+
+These are accumulated from Conv 0A through Conv 18:
+
+- **"Success. No rows returned"** for UPDATE/DELETE without RETURNING does NOT mean zero rows were affected. It means the statement executed and returned no result set. Always use RETURNING to confirm what happened.
+- **`?` JSONB operator** is interpreted as a prepared statement placeholder. Use `jsonb_exists()` instead.
+- **`array_agg()` on empty input** returns NULL against NOT NULL columns. Wrap in `COALESCE(..., '{}'::text[])`.
+- **RAISE NOTICE** output is not displayed. Use RETURNING or explicit SELECT for debugging.
+- **ALTER TYPE ... ADD VALUE** is non-destructive and safe mid-project.
+
+---
+
+## 11. File Deployment Discipline
+
+- When downloading multiple files with the same name, macOS appends (1)/(2) suffixes. Always verify with `head -5` before placing.
+- After `cp` to the Edge Functions directory, verify the file content before deploying.
+- The Supabase secrets dashboard shows only digests, not raw values. The raw API_KEY_HMAC_SECRET must be preserved externally.
+
+---
+
+## 12. Checklist for New RPC Functions
+
+Every new SECURITY DEFINER RPC must:
+
+- [ ] Include `PERFORM set_config('app.tenant_id', p_tenant_id::text, true)`
+- [ ] Include `WHERE tenant_id = p_tenant_id` on every query (never rely on RLS inside SECURITY DEFINER)
+- [ ] Verify any referenced entity belongs to the tenant before operating on it
+- [ ] Return only the columns needed (no SELECT *)
+
+---
+
+## 13. Checklist for New Tables
+
+Every new tenant-scoped table must have:
+
+- [ ] `tenant_id uuid NOT NULL REFERENCES tenants(id)` column
+- [ ] RLS enabled with appropriate policies
+- [ ] Subscription check trigger (`check_subscription_active`)
+- [ ] If immutable: BEFORE UPDATE OR DELETE trigger
+- [ ] Appropriate indexes (at minimum on tenant_id)
+
+---
+
+## Current Trigger Inventory
+
+| Table | Trigger | Purpose |
+|-------|---------|---------|
+| consent_records | trg_consent_records_immutable | Blocks UPDATE and DELETE |
+| consent_records | trg_consent_records_subscription_check | Blocks INSERT when subscription expired |
+| audit_log | trg_audit_log_immutable | Blocks UPDATE and DELETE |
+| contacts | trg_contacts_subscription_check | Blocks INSERT/UPDATE when subscription expired |
+| message_checks | trg_message_checks_subscription_check | Blocks INSERT when subscription expired |
+| unsubscribe_requests | trg_unsubscribe_requests_subscription_check | Blocks INSERT when subscription expired |
+| sender_profiles | trg_sender_profiles_subscription_check | Blocks INSERT/UPDATE when subscription expired |
+| api_keys | trg_api_keys_subscription_check | Blocks INSERT when subscription expired |
+| tenants | chk_cancelled_requires_expiry | CHECK: cancelled status requires non-null expiry |
