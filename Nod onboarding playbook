@@ -1,0 +1,269 @@
+# Nod — Dealership Onboarding Playbook
+
+**Version:** 1.0
+**Created:** April 4, 2026
+**Validated against:** Mills Motors pilot onboarding
+
+---
+
+## Overview
+
+This playbook walks through every step required to onboard a new auto dealership onto the Nod CASL compliance platform. A dealership should go from "never heard of Nod" to "seeing their compliance posture on the dashboard" within one session (30–60 minutes for API setup, plus DMS export time on their end).
+
+The playbook assumes you (the Nod operator) are running the API calls on behalf of the dealership during the initial white-glove onboarding. Once onboarded, the dealership accesses everything through the compliance dashboard.
+
+---
+
+## Pre-Onboarding (Before the Call)
+
+### What you need from the dealership before the onboarding session:
+
+1. **Dealership name** — legal business name as it appears on correspondence
+2. **Compliance Officer** — name and email of the person responsible for CASL compliance (usually the GM, marketing manager, or owner)
+3. **Province** — two-letter code (ON, BC, AB, etc.)
+4. **DMS contact export** — CSV or spreadsheet from their Dealer Management System containing:
+   - Customer full name
+   - Email address
+   - Phone number (if available)
+   - Most recent purchase date (if applicable)
+   - Most recent inquiry/test drive date (if applicable)
+   - Financing contract start and end dates (if applicable)
+   - Any record of express marketing opt-in (date + how it was obtained)
+
+### What you prepare on the Nod side:
+
+1. **Create the tenant** in the Supabase tenants table:
+   - Generate a UUID for the tenant
+   - Set subscription_status to 'trialing'
+   - Set max_contacts and max_messages_per_month per their plan tier
+   - Set timezone (e.g., 'America/Toronto' for Ontario dealerships)
+   - Set province
+
+2. **Generate an API key** for the tenant:
+   - Key format: `nod_live_{dealership_short_name}_{year}`
+   - HMAC-hash the key and store in api_keys table
+   - **Show the raw key to the dealership exactly once** — it cannot be retrieved later
+
+3. **Create a dashboard account** (if using the compliance dashboard):
+   - Create a Supabase Auth user for the compliance officer's email
+   - Insert a tenant_users row mapping that auth user to the tenant with role 'admin'
+
+---
+
+## Step 1: Sender Profile Configuration
+
+**Time:** 5 minutes
+**Who does it:** You (during onboarding call) or the dealership (via dashboard Settings → Sender Profiles)
+
+Every CEM the dealership sends must identify the sender per CASL s.6(2). Configure at least one sender profile with:
+
+- **sender_name** — dealership name as it appears on emails/texts
+- **mailing_address** — physical address
+- **phone** — dealership phone number in E.164 format (+1XXXXXXXXXX)
+- **email** — general contact email
+- **website_url** — dealership website
+- **is_default** — set to true for the primary profile
+
+**API call:**
+```
+POST /api-sender-profiles
+Authorization: Bearer {api_key}
+```
+
+**What to verify:**
+- Response returns 201 with all fields populated
+- is_default is true
+- All three contact methods (phone, email, website_url) are present — this maximizes the sender_profile_completeness score
+
+**Dealership-friendly explanation:**
+> "This is your business card for emails and texts. CASL requires every marketing message to identify who sent it, with your name, address, and a way for people to contact you. We're setting that up now so every message you send through Nod automatically includes it."
+
+---
+
+## Step 2: DMS Contact Import
+
+**Time:** 10–20 minutes (depends on export size and data quality)
+**Who does it:** You (during onboarding call)
+
+Import the dealership's customer contacts from their DMS export. Nod automatically classifies consent based on the data provided:
+
+| DMS Data Provided | Consent Type Created | Expiry |
+|---|---|---|
+| purchase_date within 2 years | implied_ebr | 2 years from purchase |
+| inquiry_date within 6 months | implied_inquiry | 6 months from inquiry |
+| financing_contract_start + end | implied_ebr_contract | 2 years from contract end |
+| express_consent_date + purpose + evidence | express | Never (until withdrawn) |
+| No consent-related dates | No consent record | Contact created, status = no_consent |
+
+**API call:**
+```
+POST /api-contacts/import
+Authorization: Bearer {api_key}
+```
+
+**Required fields per contact:**
+- `full_name` — not first_name/last_name, must be combined
+- `email` — valid email format (at minimum; phone is optional)
+
+**Optional consent fields:**
+- `purchase_date` — YYYY-MM-DD
+- `inquiry_date` — YYYY-MM-DD
+- `financing_contract_start` — YYYY-MM-DD
+- `financing_contract_end` — YYYY-MM-DD
+- `express_consent_date` — YYYY-MM-DD
+- `express_consent_purpose` — description of what they consented to
+- `express_consent_evidence` — how consent was obtained
+
+**What to verify:**
+- `imported` count matches the number of contacts in the CSV
+- `duplicates` is 0 (first import)
+- `consent_records_created` is reasonable (should be at least as many contacts that had purchase/inquiry/financing dates)
+- Check `classification_warnings` — common issue: express consent records missing `express_purpose`
+
+**If express consent was missed during import:**
+Record it separately via the consent API:
+```
+POST /api-consent
+```
+Required fields: contact_id, consent_type, channel, qualifying_event_type, qualifying_event, qualifying_event_date, purpose, evidence
+
+**Dealership-friendly explanation:**
+> "We're loading your customer list from your DMS. For every customer, Nod looks at their history — when they bought a car, when they inquired, whether they have a financing contract — and figures out what kind of marketing consent you have for them under CASL, and when it expires. Customers with no recent transaction history show up as 'no consent' — you can't send them marketing emails until they opt in."
+
+---
+
+## Step 3: First Pre-Send Check
+
+**Time:** 5 minutes
+**Who does it:** You (during onboarding call, as a demo)
+
+This is the "aha moment" for the dealership. Pick two contacts from the import — one with valid consent and one without — and show the dealership what happens when Nod checks whether they can send a marketing email.
+
+**API call:**
+```
+POST /api-messages/check
+Authorization: Bearer {api_key}
+```
+
+**Required fields:**
+- `contact_id` — UUID from the import response
+- `channel` — "email" or "sms"
+- `subject` — message subject line
+- `body` — message body text
+- `sender_profile_id` — UUID from Step 1
+- `unsubscribe_url` — the dealership's unsubscribe link
+
+**Demo script:**
+
+1. **Pass case:** Pick a recent purchaser. Send a promotional email. Show the response: `compliance_result: "pass"`, consent type, expiry date, days remaining.
+
+2. **Fail case:** Pick a contact with no consent. Same promotional email. Show the response: `compliance_result: "fail"`, `no_valid_consent` failure.
+
+**Dealership-friendly explanation:**
+> "This is Nod's 'Send-Safe Check.' Before you send any marketing email, Nod checks three things: Does this person have valid consent? Does the email properly identify your dealership? Does it include an unsubscribe link? If all three pass, you're clear to send. If not, Nod tells you exactly what's wrong. Sarah here bought a car in November, so she's good for marketing emails until November 2027. Emily never bought anything and hasn't opted in, so sending her a promo email would be a CASL violation — Nod blocks it."
+
+---
+
+## Step 4: First Compliance Report
+
+**Time:** 2 minutes
+**Who does it:** You (during onboarding call)
+
+Generate the compliance audit report to show the dealership their overall CASL posture.
+
+**API call:**
+```
+GET /api-compliance/audit
+Authorization: Bearer {api_key}
+```
+
+**What to walk through with the dealership:**
+- **Overall score** — explain that 100 means perfect CASL compliance; their starting score reflects the data quality from the DMS import
+- **consent_coverage** — what percentage of their contacts have valid consent
+- **Findings** — especially CONTACTS_NO_CONSENT (their immediate action item) and any CONSENT_EXPIRING alerts
+- **Expiry alerts** — contacts whose consent is about to expire, sorted by urgency (7d, 14d, 30d)
+
+**Dealership-friendly explanation:**
+> "This is your Compliance Scorecard. Right now you're at [X] out of 100. The biggest factor is consent coverage — [Y]% of your contacts have valid consent, and [Z] contacts have none. Those [Z] people are your risk: if you email them a promotion, that's a CASL violation worth up to $10 million per incident. The good news is Nod tracks all of this automatically and warns you before anyone's consent expires."
+
+---
+
+## Step 5: Compliance Program Document
+
+**Time:** 2 minutes
+**Who does it:** You (during onboarding call)
+
+Generate the full CASL compliance program — the dealership's due diligence defence under s.33.
+
+**API call:**
+```
+GET /api-compliance-program
+Authorization: Bearer {api_key}
+```
+
+**What to explain:**
+- This is a legal document the dealership can produce if the CRTC ever investigates
+- It proves they have a formal compliance program with policies, training plans, risk assessment, and audit schedules
+- It's customized with their actual data — not a generic template
+- The HTML version is stored securely and can be downloaded anytime
+- Should be regenerated quarterly or after any major change
+
+**Dealership-friendly explanation:**
+> "This is your CASL safety net. If the CRTC ever asks 'Do you have a compliance program?', you hand them this. It shows you have a designated compliance officer, documented policies for how you handle consent, a training plan for your staff, and regular audits. It's built from your actual data, not a template — that's what makes it a real due diligence defence."
+
+---
+
+## Step 6: Dashboard Walkthrough
+
+**Time:** 10 minutes
+**Who does it:** You (during onboarding call, screen-sharing)
+
+Walk the dealership through the compliance dashboard:
+
+1. **Overview page** — score, contact count, expiring consents, pending unsubscribe syncs, message usage
+2. **Contacts page** — search, filter by consent status, click into a contact to see their consent timeline
+3. **Compliance Reports** — audit history, consent breakdown chart, CRM sync log
+4. **Settings → Sender Profiles** — show them how to add/edit their sender profiles
+5. **Settings → Subscription** — plan details, usage meters
+6. **Settings → Team** — how to invite other staff members
+
+---
+
+## Post-Onboarding Checklist
+
+After the onboarding session, confirm:
+
+- [ ] Tenant created with correct province, timezone, subscription tier
+- [ ] API key generated and shared securely (shown once, never stored in plain text)
+- [ ] At least one sender profile configured with all contact methods
+- [ ] DMS contacts imported — verify imported count against source CSV
+- [ ] Express consent records added for any customers with documented opt-ins
+- [ ] First compliance audit generated — note the baseline score
+- [ ] Compliance program document generated
+- [ ] Dashboard account created for the compliance officer
+- [ ] Dealership understands: pre-send checks, consent expiry alerts, unsubscribe handling
+- [ ] Next touchpoint scheduled (1-week check-in)
+
+---
+
+## Common Onboarding Issues
+
+| Issue | Cause | Fix |
+|---|---|---|
+| `full_name is required` on import | Using first_name/last_name instead of full_name | Combine into single full_name field |
+| Express consent not created | Missing express_purpose in import payload | Record separately via POST /api-consent with all required fields |
+| `qualifying_event is required` on consent API | Missing the free-text qualifying_event description | Add qualifying_event (description), qualifying_event_type (enum), and qualifying_event_date |
+| Low consent coverage score | Many contacts with no purchase/inquiry dates in DMS | Normal for first import — run re-consent campaign for no_consent contacts |
+| Sender profile incomplete warning | Missing phone, email, or website_url | Update the profile to include all three contact methods |
+
+---
+
+## Re-Consent Campaign Guidance
+
+After onboarding, the dealership's #1 action item is usually the no_consent contacts. These are customers in the DMS with no recent transaction and no express opt-in. The dealership cannot send them CEMs, but they can:
+
+1. **Service-related messages** (Tier 2 exempt) — safety recalls, warranty notices, service appointment confirmations — these don't require marketing consent
+2. **In-person or phone re-consent** — when the customer comes in for service, get them to sign a marketing opt-in form
+3. **Transactional touchpoints** — when a no-consent customer initiates a new inquiry or purchase, their implied consent clock restarts automatically
+
+What they **cannot** do: send a "re-consent email" to no_consent contacts asking them to opt in. That email itself is a CEM and requires consent they don't have.
