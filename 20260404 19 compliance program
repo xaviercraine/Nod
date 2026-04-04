@@ -1,0 +1,205 @@
+-- ============================================
+-- NOD — Conversation 19: Compliance Program Generator
+-- Migration: get_compliance_program_data() RPC
+-- ============================================
+
+-- ============================================
+-- STEP 1: get_compliance_program_data() RPC
+-- Gathers all data needed to generate a customized CASL
+-- compliance program document for a tenant.
+-- Returns tenant info, compliance score breakdown, consent
+-- type distribution, and operational metrics.
+-- Read-only — no writes, no subscription check needed.
+-- ============================================
+
+CREATE OR REPLACE FUNCTION get_compliance_program_data(
+  p_tenant_id uuid
+)
+RETURNS TABLE (
+  -- Tenant info
+  tenant_name text,
+  tenant_contact_name text,
+  tenant_contact_email text,
+  tenant_province text,
+  tenant_timezone text,
+  tenant_onboarded_at timestamptz,
+  -- Compliance score (from tenants table, set by cron)
+  current_compliance_score integer,
+  -- Contact stats
+  total_contacts integer,
+  active_contacts integer,
+  -- Consent type distribution (active, non-withdrawal records with valid consent)
+  consent_express integer,
+  consent_pre_casl_express integer,
+  consent_implied_ebr integer,
+  consent_implied_ebr_contract integer,
+  consent_implied_inquiry integer,
+  consent_conspicuous_publication integer,
+  consent_withdrawn integer,
+  contacts_no_consent integer,
+  -- Sender profiles
+  sender_profiles_count integer,
+  sender_profiles_complete integer,
+  -- Message checks (last 30 days)
+  checks_total_30d integer,
+  checks_pass_30d integer,
+  checks_fail_30d integer,
+  checks_warning_30d integer,
+  -- CRM sync
+  unsub_total integer,
+  unsub_pending integer,
+  unsub_overdue integer,
+  -- Expiry alerts
+  expiring_7d integer,
+  expiring_14d integer,
+  expiring_30d integer,
+  -- Generated timestamp
+  generated_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_tenant RECORD;
+  v_total_contacts integer := 0;
+  v_active_contacts integer := 0;
+  v_contact_ids uuid[];
+  v_express integer := 0;
+  v_pre_casl integer := 0;
+  v_ebr integer := 0;
+  v_ebr_contract integer := 0;
+  v_inquiry integer := 0;
+  v_conspicuous integer := 0;
+  v_withdrawn integer := 0;
+  v_no_consent integer := 0;
+  v_sp_count integer := 0;
+  v_sp_complete integer := 0;
+  v_checks_total integer := 0;
+  v_checks_pass integer := 0;
+  v_checks_fail integer := 0;
+  v_checks_warning integer := 0;
+  v_unsub_total integer := 0;
+  v_unsub_pending integer := 0;
+  v_unsub_overdue integer := 0;
+  v_exp_7d integer := 0;
+  v_exp_14d integer := 0;
+  v_exp_30d integer := 0;
+BEGIN
+  PERFORM set_config('app.tenant_id', p_tenant_id::text, true);
+
+  -- Tenant info
+  SELECT t.name, t.contact_name, t.contact_email, t.province,
+         t.timezone, t.onboarded_at, t.compliance_score
+  INTO v_tenant
+  FROM tenants t
+  WHERE t.id = p_tenant_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Tenant not found' USING ERRCODE = 'P0002';
+  END IF;
+
+  -- Contact counts
+  SELECT COUNT(*)::integer INTO v_total_contacts
+  FROM contacts c WHERE c.tenant_id = p_tenant_id;
+
+  SELECT COUNT(*)::integer INTO v_active_contacts
+  FROM contacts c WHERE c.tenant_id = p_tenant_id AND c.is_active = true;
+
+  -- Active contact IDs for consent batch check
+  SELECT COALESCE(array_agg(c.id), '{}'::uuid[]) INTO v_contact_ids
+  FROM contacts c
+  WHERE c.tenant_id = p_tenant_id AND c.is_active = true;
+
+  -- Consent type distribution: count contacts by their best active consent type
+  -- Using get_consent_status_batch on email channel to match audit scoring
+  IF array_length(v_contact_ids, 1) IS NOT NULL AND array_length(v_contact_ids, 1) > 0 THEN
+    SELECT
+      COUNT(*) FILTER (WHERE cs.status = 'no_consent')::integer
+    INTO v_no_consent
+    FROM get_consent_status_batch(v_contact_ids, 'email'::message_channel, p_tenant_id) cs;
+
+    -- Expiry alerts
+    SELECT
+      COUNT(*) FILTER (WHERE cs.days_until_expiry IS NOT NULL AND cs.days_until_expiry <= 7)::integer,
+      COUNT(*) FILTER (WHERE cs.days_until_expiry IS NOT NULL AND cs.days_until_expiry > 7 AND cs.days_until_expiry <= 14)::integer,
+      COUNT(*) FILTER (WHERE cs.days_until_expiry IS NOT NULL AND cs.days_until_expiry > 14 AND cs.days_until_expiry <= 30)::integer
+    INTO v_exp_7d, v_exp_14d, v_exp_30d
+    FROM get_consent_status_batch(v_contact_ids, 'email'::message_channel, p_tenant_id) cs;
+  END IF;
+
+  -- Consent type breakdown from consent_records (not per-contact, but per-record)
+  SELECT
+    COUNT(*) FILTER (WHERE cr.consent_type = 'express' AND cr.is_withdrawal = false)::integer,
+    COUNT(*) FILTER (WHERE cr.consent_type = 'pre_casl_express' AND cr.is_withdrawal = false)::integer,
+    COUNT(*) FILTER (WHERE cr.consent_type = 'implied_ebr' AND cr.is_withdrawal = false)::integer,
+    COUNT(*) FILTER (WHERE cr.consent_type = 'implied_ebr_contract' AND cr.is_withdrawal = false)::integer,
+    COUNT(*) FILTER (WHERE cr.consent_type = 'implied_inquiry' AND cr.is_withdrawal = false)::integer,
+    COUNT(*) FILTER (WHERE cr.consent_type = 'conspicuous_publication' AND cr.is_withdrawal = false)::integer,
+    COUNT(*) FILTER (WHERE cr.is_withdrawal = true)::integer
+  INTO v_express, v_pre_casl, v_ebr, v_ebr_contract, v_inquiry, v_conspicuous, v_withdrawn
+  FROM consent_records cr
+  WHERE cr.tenant_id = p_tenant_id;
+
+  -- Sender profiles
+  SELECT
+    COUNT(*)::integer,
+    COUNT(*) FILTER (WHERE
+      sp.phone IS NOT NULL AND sp.email IS NOT NULL AND sp.website_url IS NOT NULL
+    )::integer
+  INTO v_sp_count, v_sp_complete
+  FROM sender_profiles sp
+  WHERE sp.tenant_id = p_tenant_id;
+
+  -- Message checks (last 30 days)
+  SELECT
+    COUNT(*)::integer,
+    COUNT(*) FILTER (WHERE mc.compliance_result = 'pass')::integer,
+    COUNT(*) FILTER (WHERE mc.compliance_result = 'fail')::integer,
+    COUNT(*) FILTER (WHERE mc.compliance_result = 'warning')::integer
+  INTO v_checks_total, v_checks_pass, v_checks_fail, v_checks_warning
+  FROM message_checks mc
+  WHERE mc.tenant_id = p_tenant_id
+    AND mc.checked_at > now() - interval '30 days';
+
+  -- CRM sync (unsubscribe requests)
+  SELECT
+    COUNT(*)::integer,
+    COUNT(*) FILTER (WHERE ur.crm_sync_status = 'pending')::integer,
+    COUNT(*) FILTER (WHERE ur.crm_sync_status = 'pending' AND ur.deadline_date < now())::integer
+  INTO v_unsub_total, v_unsub_pending, v_unsub_overdue
+  FROM unsubscribe_requests ur
+  WHERE ur.tenant_id = p_tenant_id;
+
+  RETURN QUERY SELECT
+    v_tenant.name,
+    v_tenant.contact_name,
+    v_tenant.contact_email,
+    v_tenant.province,
+    v_tenant.timezone,
+    v_tenant.onboarded_at,
+    v_tenant.compliance_score,
+    v_total_contacts,
+    v_active_contacts,
+    v_express,
+    v_pre_casl,
+    v_ebr,
+    v_ebr_contract,
+    v_inquiry,
+    v_conspicuous,
+    v_withdrawn,
+    v_no_consent,
+    v_sp_count,
+    v_sp_complete,
+    v_checks_total,
+    v_checks_pass,
+    v_checks_fail,
+    v_checks_warning,
+    v_unsub_total,
+    v_unsub_pending,
+    v_unsub_overdue,
+    v_exp_7d,
+    v_exp_14d,
+    v_exp_30d,
+    now();
+END;
+$$;
