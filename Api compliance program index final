@@ -1,0 +1,660 @@
+// ============================================
+// NOD — api-compliance-program/index.ts
+// Conversation 19: Compliance Program Generator (Pillar 9)
+//
+// GET /compliance-program — Generate customized CASL compliance program
+//
+// Produces a due diligence defense package [Act s.33] covering:
+// officer designation, policies, risk assessment, training,
+// audit schedule — customized to the dealership's actual data.
+//
+// Every endpoint: HMAC auth, RPC for data access, audit trail,
+// no PII in errors, try/catch with founder alert on failure.
+// ============================================
+
+import { requireAuth } from "../_shared/auth.ts";
+import { getSupabaseClient } from "../_shared/supabase.ts";
+import { insertAuditLog, getClientIp } from "../_shared/audit.ts";
+import { alertFounder } from "../_shared/alerting.ts";
+
+import {
+  checkRateLimit,
+  rateLimitExceededResponse,
+  rateLimitHeaders,
+  apiVersionHeaders,
+} from "../_shared/rate-limiter.ts";
+import type { AuthResult } from "../_shared/types.ts";
+
+// ---- CORS Headers ----
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, content-type, x-nod-version",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+};
+
+// ---- JSON Response Helpers ----
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders },
+  });
+}
+
+function errorResponse(
+  error: string,
+  code: string,
+  status: number,
+  details?: Record<string, unknown>,
+): Response {
+  return jsonResponse({ error, code, ...(details ? { details } : {}) }, status);
+}
+
+function addHeaders(response: Response, headers: Record<string, string>): Response {
+  const newResponse = new Response(response.body, response);
+  for (const [key, value] of Object.entries(headers)) {
+    newResponse.headers.set(key, value);
+  }
+  return newResponse;
+}
+
+// ---- Compliance Program Data Types ----
+
+interface ProgramData {
+  tenant_name: string;
+  tenant_contact_name: string;
+  tenant_contact_email: string;
+  tenant_province: string;
+  tenant_timezone: string;
+  tenant_onboarded_at: string | null;
+  current_compliance_score: number | null;
+  total_contacts: number;
+  active_contacts: number;
+  consent_express: number;
+  consent_pre_casl_express: number;
+  consent_implied_ebr: number;
+  consent_implied_ebr_contract: number;
+  consent_implied_inquiry: number;
+  consent_conspicuous_publication: number;
+  consent_withdrawn: number;
+  contacts_no_consent: number;
+  sender_profiles_count: number;
+  sender_profiles_complete: number;
+  checks_total_30d: number;
+  checks_pass_30d: number;
+  checks_fail_30d: number;
+  checks_warning_30d: number;
+  unsub_total: number;
+  unsub_pending: number;
+  unsub_overdue: number;
+  expiring_7d: number;
+  expiring_14d: number;
+  expiring_30d: number;
+  generated_at: string;
+}
+
+interface ComplianceProgram {
+  document_title: string;
+  generated_at: string;
+  dealership: {
+    name: string;
+    compliance_officer: string;
+    contact_email: string;
+    province: string;
+    timezone: string;
+  };
+  compliance_score: number | null;
+  sections: ProgramSection[];
+}
+
+interface ProgramSection {
+  number: number;
+  title: string;
+  casl_reference: string;
+  content: string[];
+  data_points?: Record<string, unknown>;
+}
+
+// ---- Program Generator ----
+
+function generateComplianceProgram(data: ProgramData): ComplianceProgram {
+  const consentTotal =
+    data.consent_express +
+    data.consent_pre_casl_express +
+    data.consent_implied_ebr +
+    data.consent_implied_ebr_contract +
+    data.consent_implied_inquiry +
+    data.consent_conspicuous_publication;
+
+  const coveragePct =
+    data.active_contacts > 0
+      ? Math.round((consentTotal / data.active_contacts) * 100)
+      : 0;
+
+  // Note: coveragePct can exceed 100 if contacts have multiple consent records.
+  // contacts_no_consent is the authoritative measure of contacts without any valid consent.
+  const contactsWithConsent = data.active_contacts - data.contacts_no_consent;
+  const effectiveCoveragePct =
+    data.active_contacts > 0
+      ? Math.round((contactsWithConsent / data.active_contacts) * 100)
+      : 0;
+
+  const checkPassRate =
+    data.checks_total_30d > 0
+      ? Math.round((data.checks_pass_30d / data.checks_total_30d) * 100)
+      : 100;
+
+  const genDate = new Date(data.generated_at);
+  const formattedDate = genDate.toLocaleDateString("en-CA", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone: data.tenant_timezone || "America/Toronto",
+  });
+
+  const sections: ProgramSection[] = [
+    // Section 1: Program Overview & Officer Designation
+    {
+      number: 1,
+      title: "Program Overview and Compliance Officer Designation",
+      casl_reference: "CASL s.33(1) — Due Diligence Defence",
+      content: [
+        `${data.tenant_name} maintains this Corporate CASL Compliance Program to ensure all commercial electronic messages (CEMs) sent by the organization comply with Canada's Anti-Spam Legislation (S.C. 2010, c. 23).`,
+        `This program establishes the policies, procedures, training requirements, and oversight mechanisms that constitute ${data.tenant_name}'s due diligence defence under s.33(1) of the Act.`,
+        `The designated CASL Compliance Officer for ${data.tenant_name} is ${data.tenant_contact_name} (${data.tenant_contact_email}). The Compliance Officer is responsible for: overseeing all CEM-related activities, maintaining consent records, ensuring staff training is current, conducting periodic compliance audits, and responding to CRTC inquiries.`,
+        `This program is enforced through the Nod CASL compliance platform, which provides automated consent tracking, pre-send compliance checks, and immutable audit trails for all electronic messaging activities.`,
+      ],
+      data_points: {
+        compliance_officer: data.tenant_contact_name,
+        contact_email: data.tenant_contact_email,
+        platform: "Nod CASL Compliance Platform",
+        program_effective_date: formattedDate,
+      },
+    },
+
+    // Section 2: Consent Management Policies
+    {
+      number: 2,
+      title: "Consent Management Policies",
+      casl_reference: "CASL s.6(1), s.10(1)-(2), s.10(9)",
+      content: [
+        `${data.tenant_name} collects, records, and manages consent for all commercial electronic messages in accordance with CASL s.6(1). No CEM is sent without valid consent or an applicable exemption.`,
+        `Express consent is obtained through clear, affirmative opt-in mechanisms that identify the sender, describe the purpose of messages, and inform the recipient of their right to withdraw consent at any time (s.10(1)). Express consent does not expire and remains valid until withdrawn.`,
+        `Implied consent based on existing business relationships (EBR) is tracked per s.10(9) with automatic expiry calculation: 2 years from the last purchase, lease, or service transaction. For contract-based EBRs, consent expires 2 years after contract expiry.`,
+        `Implied consent from inquiries expires 6 months from the inquiry date per s.10(9)(b). All expiry dates are calculated automatically and monitored continuously.`,
+        `Pre-CASL express consent (obtained before July 1, 2014 under PIPEDA requirements) is tracked as a distinct consent type for audit trail clarity while being treated identically to express consent for evaluation purposes.`,
+        `All consent records are stored in an immutable, append-only ledger. No consent record can be modified or deleted after creation, ensuring the integrity of the compliance evidence chain required under s.13.`,
+      ],
+      data_points: {
+        total_contacts: data.active_contacts,
+        contacts_with_consent: contactsWithConsent,
+        contacts_without_consent: data.contacts_no_consent,
+        consent_coverage_pct: effectiveCoveragePct,
+        consent_records_by_type: {
+          express: data.consent_express,
+          pre_casl_express: data.consent_pre_casl_express,
+          implied_ebr: data.consent_implied_ebr,
+          implied_ebr_contract: data.consent_implied_ebr_contract,
+          implied_inquiry: data.consent_implied_inquiry,
+          conspicuous_publication: data.consent_conspicuous_publication,
+        },
+        withdrawals_processed: data.consent_withdrawn,
+        expiring_within_7_days: data.expiring_7d,
+        expiring_within_14_days: data.expiring_14d,
+        expiring_within_30_days: data.expiring_30d,
+      },
+    },
+
+    // Section 3: CEM Compliance & Message Screening
+    {
+      number: 3,
+      title: "Commercial Electronic Message Compliance",
+      casl_reference: "CASL s.1(2), s.6(1)-(2), s.6(6)",
+      content: [
+        `All outbound electronic messages are screened through Nod's pre-send compliance check before transmission. Each message is classified as a CEM, exempt (Tier 1 or Tier 2), transactional, or non-commercial using the "one of its purposes" test established in s.1(2).`,
+        `CEMs require: (a) valid consent for the recipient on the applicable channel, (b) compliant sender identification per s.6(2), and (c) a functional unsubscribe mechanism per s.11.`,
+        `Tier 2 exemptions (s.6(6)) are applied only when a message solely performs an exempt function such as providing a quote, completing a transaction, or delivering warranty/safety information. Any commercial signal — promotional language, cross-sell offers, or calls to action — disqualifies the exemption.`,
+        `Sender identification includes the dealership name, mailing address, and at least one contact method (phone, email, or website URL). When sending on behalf of another entity, both parties are identified per s.6(2)(c).`,
+      ],
+      data_points: {
+        checks_last_30_days: data.checks_total_30d,
+        pass_rate_pct: checkPassRate,
+        checks_passed: data.checks_pass_30d,
+        checks_failed: data.checks_fail_30d,
+        checks_warning: data.checks_warning_30d,
+        sender_profiles_configured: data.sender_profiles_count,
+        sender_profiles_complete: data.sender_profiles_complete,
+      },
+    },
+
+    // Section 4: Unsubscribe & Withdrawal Handling
+    {
+      number: 4,
+      title: "Unsubscribe and Consent Withdrawal Handling",
+      casl_reference: "CASL s.11(1)-(3), Regs s.3(1)",
+      content: [
+        `Every CEM sent by ${data.tenant_name} includes a clearly visible unsubscribe mechanism that remains functional for a minimum of 60 days after the message is sent, per s.11(3) and Regulations s.3(1).`,
+        `Upon receipt of an unsubscribe or consent withdrawal request, the system immediately blocks all further CEMs to the contact on the specified channel. A 10-business-day compliance deadline is automatically calculated per s.11(1)(b), and CRM synchronization is tracked to ensure the withdrawal is reflected across all systems.`,
+        `Withdrawal requests are processed as consent records (type: withdrawal) in the immutable ledger, creating a complete timeline: original consent → withdrawal → any subsequent re-consent. Re-consent after withdrawal is permitted only through a new express opt-in.`,
+        `Overdue CRM synchronizations trigger automated alerts to the Compliance Officer to prevent deadline violations.`,
+      ],
+      data_points: {
+        total_unsubscribe_requests: data.unsub_total,
+        pending_crm_sync: data.unsub_pending,
+        overdue_crm_sync: data.unsub_overdue,
+      },
+    },
+
+    // Section 5: Record-Keeping & Proof of Compliance
+    {
+      number: 5,
+      title: "Record-Keeping and Proof of Compliance",
+      casl_reference: "CASL s.13 — Burden of Proof",
+      content: [
+        `Under s.13 of the Act, the burden of proof for consent rests with the sender. ${data.tenant_name} maintains comprehensive, tamper-proof records of all consent-related activities through the Nod platform.`,
+        `For each contact, the system can generate a complete proof dossier containing: the contact's identity, consent type and status, date/time/timezone of consent collection, method of collection, scope and purpose of consent, all evidence links, a full chronological timeline of all consent records (including withdrawals and re-consents), all pre-send compliance checks with sender profile references, and a chain of custody audit trail.`,
+        `The consent ledger is protected by database-level immutability triggers that prevent any modification or deletion of records by any user or role, including database administrators. This ensures the evidentiary integrity required for court proceedings.`,
+        `All compliance reports, proof packages, and audit documents are stored in a secure, tenant-isolated storage system with row-level security policies.`,
+      ],
+      data_points: {
+        immutable_consent_ledger: true,
+        proof_dossier_generation: "on-demand per contact",
+        storage: "tenant-isolated with RLS",
+      },
+    },
+
+    // Section 6: Training Program
+    {
+      number: 6,
+      title: "Staff Training Program",
+      casl_reference: "CASL s.33 — Due Diligence",
+      content: [
+        `${data.tenant_name} maintains a CASL training program for all staff involved in electronic messaging activities. Training covers:`,
+        `(a) What constitutes a commercial electronic message under the "one of its purposes" test. (b) The difference between express consent, implied consent (EBR and inquiry-based), and exempt messages. (c) How to use the Nod platform to verify consent before sending. (d) Proper use of sender identification and unsubscribe mechanisms. (e) The 10-business-day timeline for processing unsubscribe requests. (f) Consequences of non-compliance (individual penalties up to $1M, corporate penalties up to $10M per violation).`,
+        `Training is conducted upon hire and refreshed annually. Records of training completion are maintained by the Compliance Officer.`,
+        `The Nod platform enforces compliance procedurally — staff cannot bypass the pre-send check — reducing the risk of human error.`,
+      ],
+      data_points: {
+        training_frequency: "annually + upon hire",
+        procedural_enforcement: "automated pre-send checks",
+      },
+    },
+
+    // Section 7: Risk Assessment
+    {
+      number: 7,
+      title: "CASL Risk Assessment",
+      casl_reference: "CASL s.33 — Due Diligence",
+      content: [
+        `${data.tenant_name} has identified the following CASL-specific risks applicable to automotive dealership operations:`,
+        `HIGH RISK: Sending promotional messages (inventory alerts, seasonal offers, financing promotions) to contacts without valid consent. Mitigation: automated pre-send consent verification blocks non-compliant messages before transmission.`,
+        `MEDIUM RISK: Implied consent expiry for contacts acquired through purchases or inquiries. Mitigation: automated expiry tracking with 30/14/7-day advance alerts to enable re-consent campaigns.`,
+        `MEDIUM RISK: Service reminders that include promotional content (e.g., "vehicle due for service — 20% off tires"). Mitigation: message classification engine flags mixed-purpose messages as CEMs, requiring full consent.`,
+        `LOW RISK: Failure to process unsubscribe requests within the 10-business-day deadline. Mitigation: automated deadline calculation, CRM sync tracking, and overdue alerts to the Compliance Officer.`,
+        `LOW RISK: Incomplete sender identification in outbound messages. Mitigation: sender profile validation ensures all required fields (name, address, contact method) are present before a message passes the compliance check.`,
+      ],
+      data_points: {
+        current_compliance_score: data.current_compliance_score,
+        contacts_at_risk_no_consent: data.contacts_no_consent,
+        consent_expiring_30d: data.expiring_7d + data.expiring_14d + data.expiring_30d,
+        message_fail_rate_pct: data.checks_total_30d > 0
+          ? Math.round((data.checks_fail_30d / data.checks_total_30d) * 100)
+          : 0,
+      },
+    },
+
+    // Section 8: Audit Schedule
+    {
+      number: 8,
+      title: "Compliance Audit Schedule",
+      casl_reference: "CASL s.33 — Due Diligence",
+      content: [
+        `${data.tenant_name} conducts compliance audits at the following intervals:`,
+        `WEEKLY (automated): Compliance score recalculation covering consent coverage, CRM sync timeliness, sender profile completeness, pre-send check pass rate, and audit completeness. Results stored in the compliance dashboard.`,
+        `DAILY (automated): Consent expiry scanning with alerts at 30, 14, and 7-day thresholds. Unsubscribe deadline monitoring with overdue escalation.`,
+        `QUARTERLY (manual): The Compliance Officer reviews the overall compliance posture, examines any failed pre-send checks, verifies staff training records are current, and updates this compliance program document as needed.`,
+        `ANNUALLY: Full program review including risk assessment update, policy revision, and training refresh.`,
+        `All audit results are retained in the Nod platform and can be produced as evidence of ongoing due diligence under s.33.`,
+      ],
+      data_points: {
+        automated_weekly_audit: "compliance score recalculation",
+        automated_daily_audit: "expiry alerts + CRM deadline monitoring",
+        manual_quarterly_review: "Compliance Officer",
+        annual_program_review: "full program + risk assessment",
+      },
+    },
+
+    // Section 9: Due Diligence Defence Summary
+    {
+      number: 9,
+      title: "Due Diligence Defence Summary",
+      casl_reference: "CASL s.33(1)",
+      content: [
+        `Section 33(1) of CASL provides that a person shall not be found liable for a violation if they establish that they exercised due diligence to prevent the commission of the violation. This compliance program constitutes ${data.tenant_name}'s due diligence defence.`,
+        `${data.tenant_name} demonstrates due diligence through: (1) This documented corporate compliance program with designated officer oversight. (2) Automated, system-enforced consent verification before every commercial message. (3) An immutable, tamper-proof consent ledger that satisfies the s.13 burden of proof. (4) Continuous monitoring with automated expiry alerts, compliance scoring, and audit reporting. (5) Staff training on CASL requirements and the consequences of non-compliance. (6) Documented risk assessment with specific mitigations for dealership operations. (7) Regular audit schedule with weekly automated and quarterly manual reviews.`,
+        `This program was generated on ${formattedDate} and reflects the current compliance posture of ${data.tenant_name}. It should be reviewed and updated quarterly or whenever a material change occurs in the organization's messaging practices.`,
+      ],
+      data_points: {
+        program_generated: formattedDate,
+        compliance_score_at_generation: data.current_compliance_score,
+        consent_coverage_at_generation: effectiveCoveragePct,
+        total_contacts_at_generation: data.active_contacts,
+      },
+    },
+  ];
+
+  return {
+    document_title: `CASL Corporate Compliance Program — ${data.tenant_name}`,
+    generated_at: data.generated_at,
+    dealership: {
+      name: data.tenant_name,
+      compliance_officer: data.tenant_contact_name,
+      contact_email: data.tenant_contact_email,
+      province: data.tenant_province,
+      timezone: data.tenant_timezone,
+    },
+    compliance_score: data.current_compliance_score,
+    sections,
+  };
+}
+
+// ---- HTML Generator ----
+
+function generateProgramHtml(program: ComplianceProgram): string {
+  const genDate = new Date(program.generated_at);
+  const dateStr = genDate.toLocaleDateString("en-CA", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone: program.dealership.timezone || "America/Toronto",
+  });
+
+  const sectionsHtml = program.sections
+    .map((s) => {
+      const contentHtml = s.content.map((p) => `<p>${p}</p>`).join("\n");
+      return `
+      <div class="section">
+        <h2>${s.number}. ${s.title}</h2>
+        <p class="casl-ref"><em>${s.casl_reference}</em></p>
+        ${contentHtml}
+      </div>`;
+    })
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${program.document_title}</title>
+  <style>
+    body {
+      font-family: "Georgia", "Times New Roman", serif;
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 20px;
+      color: #1a1a1a;
+      line-height: 1.6;
+    }
+    .header {
+      text-align: center;
+      border-bottom: 3px double #333;
+      padding-bottom: 20px;
+      margin-bottom: 30px;
+    }
+    .header h1 {
+      font-size: 24px;
+      margin-bottom: 5px;
+    }
+    .header .subtitle {
+      font-size: 14px;
+      color: #555;
+    }
+    .header .legal-ref {
+      font-size: 12px;
+      color: #777;
+      margin-top: 8px;
+    }
+    .meta {
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 15px 20px;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    .meta strong { display: inline-block; width: 180px; }
+    .section {
+      margin-bottom: 30px;
+      page-break-inside: avoid;
+    }
+    .section h2 {
+      font-size: 18px;
+      border-bottom: 1px solid #ccc;
+      padding-bottom: 5px;
+      margin-bottom: 10px;
+    }
+    .casl-ref {
+      font-size: 12px;
+      color: #666;
+      margin-top: -5px;
+      margin-bottom: 10px;
+    }
+    .section p {
+      margin-bottom: 10px;
+      text-align: justify;
+    }
+    .footer {
+      border-top: 3px double #333;
+      padding-top: 15px;
+      margin-top: 40px;
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+    }
+    @media print {
+      body { margin: 20px; }
+      .section { page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>CASL Corporate Compliance Program</h1>
+    <div class="subtitle">${program.dealership.name}</div>
+    <div class="legal-ref">Canada's Anti-Spam Legislation (S.C. 2010, c. 23) — Due Diligence Defence Package [s.33]</div>
+  </div>
+
+  <div class="meta">
+    <div><strong>Dealership:</strong> ${program.dealership.name}</div>
+    <div><strong>Compliance Officer:</strong> ${program.dealership.compliance_officer}</div>
+    <div><strong>Contact:</strong> ${program.dealership.contact_email}</div>
+    <div><strong>Province:</strong> ${program.dealership.province}</div>
+    <div><strong>Generated:</strong> ${dateStr}</div>
+    <div><strong>Compliance Score:</strong> ${program.compliance_score ?? "Not yet calculated"}/100</div>
+  </div>
+
+  ${sectionsHtml}
+
+  <div class="footer">
+    <p>This document was generated by the Nod CASL Compliance Platform on ${dateStr}.</p>
+    <p>It constitutes part of ${program.dealership.name}'s due diligence defence under s.33(1) of Canada's Anti-Spam Legislation.</p>
+    <p>This program should be reviewed quarterly and updated upon any material change in messaging practices.</p>
+  </div>
+</body>
+</html>`;
+}
+
+// ---- GET /compliance-program ----
+
+async function handleGetProgram(
+  request: Request,
+  auth: AuthResult,
+): Promise<Response> {
+  const supabase = getSupabaseClient();
+  const ipAddress = getClientIp(request);
+
+  // 1. Fetch all compliance program data in one RPC call
+  const { data, error } = await supabase.rpc("get_compliance_program_data", {
+    p_tenant_id: auth.tenantId,
+  });
+
+  if (error) {
+    if (error.message?.includes("Tenant not found")) {
+      return errorResponse("Tenant not found", "TENANT_NOT_FOUND", 404);
+    }
+    console.error("get_compliance_program_data RPC error:", error.message);
+    await alertFounder(
+      "Compliance Program: Data Fetch Failed",
+      `<p>Tenant: ${auth.tenantId}</p><p>Error: ${error.message}</p>`,
+    );
+    return errorResponse(
+      "Failed to retrieve compliance data",
+      "QUERY_FAILED",
+      500,
+    );
+  }
+
+  const rows = Array.isArray(data) ? data : [];
+  if (rows.length === 0) {
+    return errorResponse("No compliance data found", "NO_DATA", 404);
+  }
+
+  const programData: ProgramData = rows[0] as ProgramData;
+
+  // 2. Generate the compliance program
+  const program = generateComplianceProgram(programData);
+
+  // 3. Generate HTML document
+  const html = generateProgramHtml(program);
+  const htmlBytes = new TextEncoder().encode(html);
+
+  // 4. Upload to compliance-reports storage bucket
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const storagePath = `${auth.tenantId}/compliance-program/program_${timestamp}.html`;
+
+  const { error: uploadError } = await supabase.storage
+    .from("compliance-reports")
+    .upload(storagePath, htmlBytes, {
+      contentType: "text/html; charset=utf-8",
+      upsert: false,
+    });
+
+  let fileUrl: string | null = null;
+
+  if (uploadError) {
+    console.error("Storage upload error:", uploadError.message);
+  } else {
+    const { data: signedUrlData, error: signedUrlError } = await supabase
+      .storage
+      .from("compliance-reports")
+      .createSignedUrl(storagePath, 7 * 24 * 60 * 60);
+
+    if (signedUrlError) {
+      console.error("Signed URL error:", signedUrlError.message);
+    } else {
+      fileUrl = signedUrlData.signedUrl;
+    }
+  }
+
+  // 5. Insert compliance_reports row
+  const { data: reportData, error: reportError } = await supabase.rpc(
+    "insert_compliance_report",
+    {
+      p_tenant_id: auth.tenantId,
+      p_report_type: "compliance_program",
+      p_data: program,
+      p_contact_id: null,
+      p_file_url: fileUrl,
+    },
+  );
+
+  if (reportError) {
+    console.error("insert_compliance_report error:", reportError.message);
+  }
+
+  const reportId =
+    reportData && reportData.length > 0 ? reportData[0].id : null;
+
+  // 6. Audit log
+  await insertAuditLog({
+    tenantId: auth.tenantId,
+    action: "proof_generated",
+    entityType: "compliance_report",
+    entityId: reportId ?? auth.tenantId,
+    details: {
+      report_type: "compliance_program",
+      compliance_score: program.compliance_score,
+      sections_count: program.sections.length,
+      file_url: fileUrl,
+    },
+    apiKeyId: auth.apiKeyId,
+    ipAddress: ipAddress,
+  });
+
+  // 7. Return JSON program + metadata
+  return jsonResponse({
+    program,
+    report_id: reportId,
+    pdf_url: fileUrl,
+  });
+}
+
+// ---- Main Handler ----
+
+Deno.serve(async (request) => {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  try {
+    // Auth
+    const auth = await requireAuth(request);
+    if (auth instanceof Response) return addHeaders(auth, apiVersionHeaders());
+
+    // Rate limiting
+    const rlResult = await checkRateLimit(auth.apiKeyId, auth.tenantId);
+    if (rlResult && !rlResult.allowed) {
+      return rateLimitExceededResponse(rlResult, corsHeaders);
+    }
+
+    const extraHeaders: Record<string, string> = {
+      ...apiVersionHeaders(),
+      ...(rlResult ? rateLimitHeaders(rlResult) : {}),
+    };
+
+    if (request.method === "GET") {
+      return addHeaders(await handleGetProgram(request, auth), extraHeaders);
+    }
+
+    return addHeaders(
+      errorResponse("Method not allowed", "METHOD_NOT_ALLOWED", 405),
+      extraHeaders,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+
+    if (message.includes("P0003") || message.includes("Subscription expired")) {
+      return addHeaders(
+        errorResponse(
+          "Subscription expired. Write operations are blocked.",
+          "SUBSCRIPTION_EXPIRED",
+          403,
+        ),
+        apiVersionHeaders(),
+      );
+    }
+
+    console.error("Unhandled error in api-compliance-program:", message);
+
+    await alertFounder(
+      "api-compliance-program Unhandled Error",
+      `<p>Error: ${message}</p><p>Stack: ${err instanceof Error ? err.stack : "N/A"}</p>`,
+    );
+
+    return addHeaders(
+      errorResponse("Internal server error", "INTERNAL_ERROR", 500),
+      apiVersionHeaders(),
+    );
+  }
+});
